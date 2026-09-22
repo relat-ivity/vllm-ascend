@@ -656,6 +656,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     prefill_chunk_offsets = None
     scatter_src_indices = torch.empty(0, dtype=torch.long, device=device)
     scatter_dst_slots = torch.empty(0, dtype=torch.long, device=device)
+    conv_scatter_end_indices = torch.empty(0, dtype=torch.long, device=device)
     if num_prefills > 0:
         prefill_query_lens = query_lens[num_decodes:]
         prefill_context_lens = context_lens[num_decodes:]
@@ -695,6 +696,15 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
             scatter_rows = block_table_2d[num_decodes:].index_select(0, scatter_seq_ids)
             scatter_block_indices = prefill_block_first.to(torch.long).index_select(0, scatter_seq_ids) + local_offsets
             scatter_dst_slots = scatter_rows.gather(1, scatter_block_indices.unsqueeze(1)).squeeze(1).to(torch.long)
+
+            # Conv state at a block boundary is simply the last
+            # (kernel_width - 1) mixed_qkv inputs before that boundary.
+            # Save the flattened token END position for each intermediate
+            # boundary so the forward path can gather those inputs directly,
+            # without replacing the native CausalConv1d with the APC Triton
+            # convolution kernel.
+            prefill_query_starts = m.query_start_loc[num_decodes:num_seqs].to(torch.long)
+            conv_scatter_end_indices = prefill_query_starts.index_select(0, scatter_seq_ids) + (local_offsets + 1) * block_size            
             scatter_src_indices = (
                 prefill_chunk_offsets[:-1].index_select(0, scatter_seq_ids)
                 + prefill_chunk_start
@@ -707,6 +717,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
             if valid_scatter.numel() != scatter_dst_slots.numel():
                 scatter_dst_slots = scatter_dst_slots.index_select(0, valid_scatter)
                 scatter_src_indices = scatter_src_indices.index_select(0, valid_scatter)
+                conv_scatter_end_indices = conv_scatter_end_indices.index_select(0, valid_scatter)
 
     attn_metadata.is_all_mode = True
     attn_metadata.mamba_block_size = block_size
@@ -721,6 +732,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
     attn_metadata.scatter_src_indices_tensor = scatter_src_indices
     attn_metadata.scatter_dst_slots_tensor = scatter_dst_slots
+    attn_metadata.conv_scatter_end_indices_tensor = conv_scatter_end_indices
 
 
 def _warn_all_mode_spec_fallback_once() -> None:
