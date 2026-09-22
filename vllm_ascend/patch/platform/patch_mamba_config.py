@@ -43,7 +43,7 @@ def _qwen35_g_cache_enabled(vllm_config) -> bool:
     return ( 
         not is_310p() 
         and model_type.startswith("qwen3_5") 
-        and vllm_config.cache_config.mamba_cache_mode == "align" 
+        and vllm_config.cache_config.mamba_cache_mode == "all" 
         and _using_ucm_kv_bridge(vllm_config) 
     ) 
 
