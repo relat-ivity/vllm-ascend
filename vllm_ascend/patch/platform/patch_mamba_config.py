@@ -1,6 +1,7 @@
 # mypy: ignore-errors
 import math
 
+import torch
 import vllm.model_executor.models.config
 from vllm.logger import logger
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
@@ -9,6 +10,42 @@ from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, get_kv_cache_torch_dtype
 from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+
+from vllm_ascend.utils import is_310p 
+ 
+ 
+_KVB_HYBRID_CONNECTOR = "UCMKvBridgeHybridConnector" 
+ 
+ 
+def _using_ucm_kv_bridge(vllm_config) -> bool: 
+    """Return whether the UCM hybrid KV bridge is configured.""" 
+    kv_transfer_config = vllm_config.kv_transfer_config 
+    if not kv_transfer_config: 
+        return False 
+ 
+    connector = kv_transfer_config.kv_connector 
+    if connector == _KVB_HYBRID_CONNECTOR: 
+        return True 
+    if connector != "MultiConnector": 
+        return False 
+ 
+    extra_config = kv_transfer_config.kv_connector_extra_config or {} 
+    return any( 
+        item.get("kv_connector") == _KVB_HYBRID_CONNECTOR 
+        for item in extra_config.get("connectors", ()) 
+    ) 
+ 
+ 
+def _qwen35_g_cache_enabled(vllm_config) -> bool: 
+    """Enable the write-only g state only for Qwen3.5 + UCM align mode.""" 
+    hf_text_config = vllm_config.model_config.hf_text_config 
+    model_type = str(getattr(hf_text_config, "model_type", "")) 
+    return ( 
+        not is_310p() 
+        and model_type.startswith("qwen3_5") 
+        and vllm_config.cache_config.mamba_cache_mode == "align" 
+        and _using_ucm_kv_bridge(vllm_config) 
+    ) 
 
 
 @classmethod
@@ -61,6 +98,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # get mamba block size
     mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
     mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    save_qwen35_g = _qwen35_g_cache_enabled(vllm_config)
     mamba_sizes = []
     for shape, dtype in zip(mamba_shapes, mamba_dtypes):
         mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
@@ -106,19 +144,49 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # compute new attention page size
     attn_page_size = cache_config.block_size * attn_token_page_size
 
-    # pad mamba page size for conv_blocks
+    if save_qwen35_g: 
+        # In align mode the g sidecar is one value per token in a Mamba block. 
+        # Compute it after block_size has been finalized above. 
+        cache_config.mamba_block_size = cache_config.block_size 
+        hf_text_config = model_config.hf_text_config 
+        local_num_v_heads = ( 
+            hf_text_config.linear_num_value_heads 
+            // parallel_config.tensor_parallel_size 
+        ) 
+        g_shape = (cache_config.mamba_block_size, local_num_v_heads) 
+        mamba_sizes.append( 
+            math.prod(g_shape) * get_dtype_size(torch.float32) 
+        ) 
+ 
+    # Prefer the existing Ascend hybrid-page padding. Grow the page only if the 
+    # third state does not fit in that tail. 
+    real_mamba_page_size = sum(mamba_sizes) 
+    base_padded_mamba_page_size = attn_page_size + conv_block_page_size 
+    padded_mamba_page_size = ( 
+        max(base_padded_mamba_page_size, real_mamba_page_size) 
+        if save_qwen35_g 
+        else base_padded_mamba_page_size 
+    )
     if (
         cache_config.mamba_page_size_padded is None
-        or cache_config.mamba_page_size_padded != attn_page_size + conv_block_page_size
+        or cache_config.mamba_page_size_padded != padded_mamba_page_size
     ):
-        cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
-        mamba_padding_pct = 100 * conv_block_page_size / cache_config.mamba_page_size_padded
-        logger.info(
-            "Padding mamba page size by %.2f%% to ensure "
-            "that mamba page size and attention page size are "
-            "exactly equal.",
-            mamba_padding_pct,
-        )
+        cache_config.mamba_page_size_padded = padded_mamba_page_size 
+        if save_qwen35_g: 
+            padding_size = padded_mamba_page_size - real_mamba_page_size 
+            mamba_padding_pct = 100 * padding_size / padded_mamba_page_size 
+            logger.info(
+                "Padding mamba page size by %.2f%%; Qwen3.5 g KV cache enabled.",
+                mamba_padding_pct,
+            )
+        else:
+            mamba_padding_pct = 100 * conv_block_page_size / padded_mamba_page_size
+            logger.info(
+                "Padding mamba page size by %.2f%% to ensure "
+                "that mamba page size and attention page size are "
+                "exactly equal.",
+                mamba_padding_pct,
+            )
     if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode in ("align", "all"):
         cache_config.mamba_block_size = cache_config.block_size
     else:

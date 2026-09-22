@@ -207,6 +207,9 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             block_table_tensor=self.block_table_tensor,
             slot_mapping=self.slot_mapping,
             causal=self.causal,
+            is_prefilling=self.is_prefilling[:num_actual_reqs]
+            if self.is_prefilling is not None
+            else None,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
             positions=self.positions,
             attn_state=self.attn_state,

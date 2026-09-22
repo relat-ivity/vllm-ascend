@@ -2468,6 +2468,17 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        # Keep the scheduler-level prefill/decode identity. GDN may later
+        # reclassify a one-token prefill as decode for kernel selection, but the
+        # g sidecar must still follow scheduler semantics. Graph-capture batches
+        # are decode-only and must not write g_cache.
+        is_prefilling = torch.zeros(num_reqs_padded, dtype=torch.bool)
+        if not for_cudagraph_capture and num_reqs > 0:
+            is_prefilling[:num_reqs] = torch.from_numpy(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                < self.input_batch.num_prompt_tokens[:num_reqs]
+            )
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],

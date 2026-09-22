@@ -396,6 +396,73 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def __init__(
+        self,
+        config,
+        vllm_config,
+        prefix: str = "",
+        create_in_proj_qkvz: bool = True,
+        gqa_interleaved_layout: bool = False,
+    ) -> None:
+        super().__init__(
+            config=config,
+            vllm_config=vllm_config,
+            prefix=prefix,
+            create_in_proj_qkvz=create_in_proj_qkvz,
+            gqa_interleaved_layout=gqa_interleaved_layout,
+        )
+        # Import lazily to avoid a platform-patch <-> custom-op import cycle.
+        from vllm_ascend.patch.platform.patch_mamba_config import (
+            _qwen35_g_cache_enabled,
+        )
+
+        self._save_g_to_kv_cache = _qwen35_g_cache_enabled(vllm_config)
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        state_shapes = super().get_state_shape()
+        if not getattr(self, "_save_g_to_kv_cache", False):
+            return state_shapes
+
+        g_shape = (
+            self.cache_config.mamba_block_size,
+            self.num_v_heads // self.tp_size,
+        )
+        return (*state_shapes, g_shape)
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        state_dtypes = super().get_state_dtype()
+        if not getattr(self, "_save_g_to_kv_cache", False):
+            return state_dtypes
+        return (*state_dtypes, torch.float32)
+
+    def _save_prefill_g(
+        self,
+        g: torch.Tensor,
+        token_indices: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write scheduler-prefill g values into the third Mamba state."""
+        if len(self.kv_cache) != 3:
+            raise RuntimeError(
+                "Qwen3.5 g KV cache expects exactly three Mamba states."
+            )
+
+        g_cache = self.kv_cache[2]
+        g_prefill = g.squeeze(0).index_select(
+            0, token_indices.to(dtype=torch.long)
+        )
+        slots = slot_mapping.to(dtype=torch.long)
+
+        block_size = g_cache.shape[1]
+        valid = (slots >= 0) & (slots < g_cache.shape[0] * block_size)
+        physical_blocks = slots[valid] // block_size
+        block_offsets = slots[valid] % block_size
+
+        # Sidecar only: the recurrent path below still consumes the original g.
+        g_cache[physical_blocks, block_offsets] = g_prefill[valid].to(
+            dtype=g_cache.dtype
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -588,6 +655,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Qwen3Next: torch_npu ops support float16/bf16 ssm_state.
             # g/beta are needed for both spec-decode and decode, so compute unconditionally.
             g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
+            if getattr(self, "_save_g_to_kv_cache", False):
+                token_indices = getattr(
+                    attn_metadata, "_ascend_g_prefill_token_indices", None
+                )
+                slot_mapping = getattr(
+                    attn_metadata, "_ascend_g_prefill_slot_mapping", None
+                )
+                if (
+                    (token_indices is None or slot_mapping is None)
+                    and attn_metadata.num_prefills > 0
+                ):
+                    raise RuntimeError(
+                        "Qwen3.5 g KV cache is enabled but prefill slot metadata "
+                        "was not built."
+                    )
+                # Decode-only / graph-capture metadata carries no prefill indices.
+                if token_indices is not None and token_indices.numel() > 0:
+                    assert slot_mapping is not None
+                    self._save_prefill_g(g, token_indices, slot_mapping)
+
             if spec_sequence_masks is not None:
                 if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                     g_spec = g
@@ -681,6 +768,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # NOTE: Once torch_npu supports float32 ssm_state, this branch can be removed.
             if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
                 g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
+                if getattr(self, "_save_g_to_kv_cache", False):
+                    token_indices = getattr(
+                        attn_metadata, "_ascend_g_prefill_token_indices", None
+                    )
+                    slot_mapping = getattr(
+                        attn_metadata, "_ascend_g_prefill_slot_mapping", None
+                    )
+                    if (
+                        (token_indices is None or slot_mapping is None)
+                        and attn_metadata.num_prefills > 0
+                    ):
+                        raise RuntimeError(
+                            "Qwen3.5 g KV cache is enabled but prefill slot metadata "
+                            "was not built."
+                        )
+                    # Decode-only / graph-capture metadata carries no prefill indices.
+                    if token_indices is not None and token_indices.numel() > 0:
+                        assert slot_mapping is not None
+                        self._save_prefill_g(g, token_indices, slot_mapping)
+
                 if spec_sequence_masks is not None:
                     if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                         g_spec = g
