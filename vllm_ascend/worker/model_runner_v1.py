@@ -110,6 +110,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.ops.gdn import has_kvb_chunks, kvb_forward_input_context
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -1486,6 +1487,22 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
+                # Decide AFTER updating requests, including prompt-logprob flags.
+                # Dynamic spans require eager execution and unpartitioned tokens.
+                can_batch_use_kvb = (
+                    has_kvb_chunks(getattr(scheduler_output, "kv_connector_metadata", None))
+                    and self.speculative_config is None
+                    and self.parallel_config.pipeline_parallel_size == 1
+                    and self.parallel_config.data_parallel_size == 1
+                    and not self.parallel_config.enable_dbo
+                    and self.pcp_size == 1
+                    and getattr(self.parallel_config, "decode_context_parallel_size", 1) == 1
+                    and not enable_sp(self.vllm_config)
+                    and not enable_sp_by_pass()
+                )
+                # A pending prefix must still be consumed when another request
+                # asks for prompt logprobs; only NEW reuse is disabled then.
+                kvb_allow_reuse = can_batch_use_kvb and not self.num_prompt_logprobs
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -1558,7 +1575,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=self.model_config.enforce_eager or can_batch_use_kvb,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -1708,7 +1725,12 @@ class NPUModelRunner(GPUModelRunner):
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or can_batch_use_kvb,
+            ),
+            kvb_forward_input_context(
+                get_forward_context(), self.input_batch,
+                self.gdn_query_start_loc.cpu if self._has_gdn else self.query_start_loc.cpu,
+                can_batch_use_kvb, allow_reuse=kvb_allow_reuse,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
