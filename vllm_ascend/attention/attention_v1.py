@@ -23,6 +23,8 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -67,6 +69,38 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+
+logger = init_logger(__name__)
+
+
+def _log_kvb_fa_execution(layer_name, query_tokens, attn_metadata):
+    """Report queries actually dispatched by the unmasked FA path, not hits."""
+    context = get_forward_context()
+    inputs = getattr(context, "kvb_gdn_inputs", None)
+    if inputs is None:
+        return
+    query_ends = attn_metadata.actual_seq_lengths_q
+    query_tokens = min(query_tokens, query_ends[-1])
+    if list(query_ends) != inputs["query_start_loc"][1:] or query_tokens != inputs["query_start_loc"][-1]:
+        logger.info(
+            "KVB EXEC FA layer=%s actual_query_tokens=%s skipped_query=0 request_range_mapping=unavailable",
+            layer_name, query_tokens,
+        )
+        return
+    masks = getattr(context, "compute_masks", {})
+    for index, request_id in enumerate(inputs["request_ids"]):
+        begin, end = inputs["query_start_loc"][index : index + 2]
+        if begin == end:
+            continue
+        start = inputs["positions"][index]
+        mask = masks.get(index)
+        candidate_tokens = int(mask.sum()) if mask is not None else 0
+        logger.info(
+            "KVB EXEC FA request=%s layer=%s step=[%s,%s) scheduled=%s computed_query=%s "
+            "skipped_query=0 mask_candidate_tokens=%s computed_ranges=%s mode=dense_mask_not_consumed",
+            request_id, layer_name, start, start + end - begin, end - begin, end - begin,
+            candidate_tokens, [(start, start + end - begin)],
+        )
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1138,6 +1172,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
+        _log_kvb_fa_execution(layer.layer_name, num_tokens, attn_metadata)
         return output
 
 

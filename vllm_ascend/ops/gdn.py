@@ -23,6 +23,7 @@ import torch
 import torch_npu
 from einops import rearrange
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule,
 )
@@ -41,6 +42,8 @@ from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_npu
 from vllm_ascend.utils import enable_sp
+
+logger = init_logger(__name__)
 
 # ──────────────────────────────────────────────────────────────────
 # All-mode prefix caching helpers (P4)
@@ -557,6 +560,19 @@ def build_gdn_segment_metadata(base, *, start, length, source, destination, is_p
     return meta
 
 
+def _log_kvb_gdn_execution(layer, request_id, start, end, computed, composed, carried=()):
+    """Report executed host-side branches without synchronizing the device."""
+    computed_tokens = sum(last - first for first, last in computed)
+    composed_tokens = sum(last - first for first, last in composed)
+    carried_tokens = sum(last - first for first, last in carried)
+    logger.info(
+        "KVB EXEC GDN request=%s layer=%s step=[%s,%s) scheduled=%s computed=%s "
+        "composed=%s carried=%s skipped_dense=%s computed_ranges=%s composed_ranges=%s carried_ranges=%s",
+        request_id, layer.prefix, start, end, end - start, computed_tokens,
+        composed_tokens, carried_tokens, composed_tokens + carried_tokens, computed, composed, carried,
+    )
+
+
 def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
     """Run original GDN kernels only on misses and compose all hit checkpoints."""
     layer_hits = context.kvb_gdn_meta.get(layer.prefix, {})
@@ -584,7 +600,10 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
             is_prefill = position < inputs["prompt_lengths"][index]
             source = sources[index] if has_initial[index] else -1
             hits = layer_hits.get(request_id, ())
-            for first, last, hit in iter_compute_and_reuse_segments(position, token_end - token_start, base.mamba_block_size, hits):
+            computed, composed = [], []
+            for first, last, hit in iter_compute_and_reuse_segments(
+                position, token_end - token_start, base.mamba_block_size, hits
+            ):
                 if hit is not None:
                     initial = state[source].clone() if source >= 0 else torch.zeros_like(state[0])
                     slots = hit["destination_block_ids"]
@@ -593,6 +612,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
                     conv[slots] = hit["conv"].to(conv.dtype)
                     g[slots] = hit["g"].to(g.dtype)
                     source = slots[-1]
+                    composed.append((first, last))
                     continue
                 destination = tables[index][first // base.mamba_block_size]
                 meta = build_gdn_segment_metadata(
@@ -608,7 +628,11 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
                 context.attn_metadata = {layer.prefix: meta}
                 begin = token_start + first - position
                 dense_forward(hidden_states[begin : begin + last - first], output[begin : begin + last - first])
+                computed.append((first, last))
                 source = destination
+            _log_kvb_gdn_execution(
+                layer, request_id, position, position + token_end - token_start, computed, composed
+            )
     finally:
         context.attn_metadata = original
 
@@ -641,10 +665,17 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             hits = layer_hits.get(rid, ())
             step_end = start + end - begin
             cross_step_state = incoming.get(rid)
-            carry_end = cross_step_state["destination_start"] + cross_step_state["length"] if cross_step_state is not None else start
+            carry_end = (
+                cross_step_state["destination_start"] + cross_step_state["length"]
+                if cross_step_state is not None else start
+            )
             compute_start = min(step_end, max(start, carry_end))
+            computed, composed = [], []
+            carried = [(start, compute_start)] if compute_start > start else []
             # Validate the complete execution plan before modifying any cache.
-            segments = list(iter_compute_and_reuse_segments(compute_start, step_end - compute_start, block_size, hits, allow_ahead=True))
+            segments = list(iter_compute_and_reuse_segments(
+                compute_start, step_end - compute_start, block_size, hits, allow_ahead=True
+            ))
             conv_work = torch.zeros_like(conv[:1])
             state_work = torch.zeros_like(state[:1])
             has_initial = False
@@ -707,6 +738,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                         next_step_state["layers"][layer.prefix]["conv"].copy_(conv_work[0])
                         next_step_state["completed_layer_names"].add(layer.prefix)
                         saved_continuation = True
+                    composed.append((first, actual_last))
                     continue
                 destination = table[first // block_size]
                 meta = build_gdn_segment_metadata(
@@ -725,6 +757,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 context.attn_metadata = {layer.prefix: meta}
                 token = begin + first - start
                 dense_forward(hidden_states[token : token + last - first], output[token : token + last - first])
+                computed.append((first, last))
                 has_initial = True
                 if destination not in protected_state_slot_ids:
                     state[destination].copy_(state_work[0])
@@ -732,6 +765,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                     saved_continuation = True
             if cross_step_state is not None and saved_continuation:
                 cross_step_state["consumed_layer_names"].add(layer.prefix)
+            _log_kvb_gdn_execution(layer, rid, start, step_end, computed, composed, carried)
     finally:
         context.attn_metadata = original
         context.kvb_gdn_work_cache = previous_work
@@ -811,8 +845,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         output: torch.Tensor,
     ):
         context = get_forward_context()
-        if getattr(context, "kvb_gdn_meta", {}).get(self.prefix) or getattr(context, "kvb_gdn_cross_step_inputs", {}).get(
-            self.prefix
+        if (
+            getattr(context, "kvb_gdn_meta", {}).get(self.prefix)
+            or getattr(context, "kvb_gdn_cross_step_inputs", {}).get(self.prefix)
         ):
             run_segmented_gdn(
                 self,
@@ -825,6 +860,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             maybe_save_kv_layer_to_connector("", [])
             return
         self._forward_dense(hidden_states, output)
+        inputs = getattr(context, "kvb_gdn_inputs", None)
+        if inputs is not None:
+            for index, request_id in enumerate(inputs["request_ids"]):
+                start = inputs["positions"][index]
+                begin, end = inputs["query_start_loc"][index : index + 2]
+                if end > begin:
+                    _log_kvb_gdn_execution(
+                        self, request_id, start, start + end - begin, [(start, start + end - begin)], []
+                    )
 
     def _forward_dense(self, hidden_states, output, *, segmented=False):
         """
