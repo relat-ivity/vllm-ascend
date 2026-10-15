@@ -171,5 +171,14 @@ def _patched_qwen35_init(self, *, vllm_config, prefix=""):
     with _temporary_mamba_cache_mode(cache_config, "align"):
         _original_qwen35_init(self, vllm_config=vllm_config, prefix=prefix)
 
+    # GDN instances were constructed while the mode was temporarily "align".
+    # Refresh the sidecar flag after restoring "all", before cache specs are read.
+    from vllm_ascend.patch.platform.patch_mamba_config import _qwen35_g_cache_enabled
+
+    save_g = _qwen35_g_cache_enabled(vllm_config)
+    for layer in self.modules():
+        if hasattr(layer, "_save_g_to_kv_cache"):
+            layer._save_g_to_kv_cache = save_g
+
 
 Qwen3_5ForConditionalGeneration.__init__ = _patched_qwen35_init

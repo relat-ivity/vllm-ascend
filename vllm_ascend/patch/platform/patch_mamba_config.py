@@ -11,9 +11,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, get_kv_cache_torch_dtype
 from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
 
-from vllm_ascend.utils import is_310p 
- 
- 
+from vllm_ascend.utils import is_310p
+
 _KVB_HYBRID_CONNECTOR = "UCMKvBridgeHybridConnector" 
  
  
@@ -37,7 +36,7 @@ def _using_ucm_kv_bridge(vllm_config) -> bool:
  
  
 def _qwen35_g_cache_enabled(vllm_config) -> bool: 
-    """Enable the write-only g state only for Qwen3.5 + UCM align mode.""" 
+    """Enable the g sidecar for Qwen3.5 + UCM hybrid KV bridge in all mode."""
     hf_text_config = vllm_config.model_config.hf_text_config 
     model_type = str(getattr(hf_text_config, "model_type", "")) 
     return ( 
@@ -51,11 +50,8 @@ def _qwen35_g_cache_enabled(vllm_config) -> bool:
 @classmethod
 def verify_and_update_config(cls, vllm_config) -> None:
     """
-    Ensure that page size of attention layers is greater than or
-    equal to the mamba layers. If not, automatically set the attention
-    block size to ensure that it is. If the attention page size is
-    strictly greater than the mamba page size, we pad the mamba page size
-    to make them equal.
+    Match attention K blocks exactly to contiguous SSM states.
+    The runner stores g in V with padding between g blocks only.
 
     Args:
         vllm_config: vLLM Config
@@ -110,9 +106,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     if len(mamba_shapes) == 1 and len(mamba_shapes[0]) == 3:
         conv_block_page_size = 0
 
-    # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep
-    # all cache tensors contiguous, so we align the page size of ssm_block
-    # and single attn_block
+    # SSM blocks stay contiguous, so their size must equal a K block exactly.
     if model_config.use_mla:
         attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         kv_lora_rank = model_config.hf_text_config.kv_lora_rank
@@ -126,55 +120,50 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
-    attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
-    assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
-        "Cannot align ssm_page_size and attn_page_size."
-    )
-
-    # override attention block size if either (a) the
-    # user has not set it or (b) the user has set it
-    # too small.
-    if cache_config.block_size is None or cache_config.block_size < attn_block_size:
-        cache_config.block_size = attn_block_size
-        logger.info(
-            "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
-            attn_block_size,
+    required_blocks = cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
+    attn_block_size = kernel_block_size * required_blocks
+    if attn_block_size % kernel_block_size or attn_single_token_k_page_size * attn_block_size != ssm_block_page_size:
+        raise ValueError(
+            "Cannot exactly align attention K block size with SSM state size using 128-token kernel blocks."
         )
+    if cache_config.block_size != attn_block_size:
+        logger.warning(
+            "Setting attention block size from %s to %d tokens to exactly match "
+            "the SSM state (%d bytes).",
+            cache_config.block_size,
+            attn_block_size,
+            ssm_block_page_size,
+        )
+        cache_config.block_size = attn_block_size
 
     # compute new attention page size
     attn_page_size = cache_config.block_size * attn_token_page_size
 
-    if save_qwen35_g: 
-        # In align mode the g sidecar is one value per token in a Mamba block. 
-        # Compute it after block_size has been finalized above. 
-        cache_config.mamba_block_size = cache_config.block_size 
-        hf_text_config = model_config.hf_text_config 
-        local_num_v_heads = ( 
-            hf_text_config.linear_num_value_heads 
-            // parallel_config.tensor_parallel_size 
-        ) 
-        g_shape = (cache_config.mamba_block_size, local_num_v_heads) 
-        mamba_sizes.append( 
-            math.prod(g_shape) * get_dtype_size(torch.float32) 
-        ) 
- 
-    # Prefer the existing Ascend hybrid-page padding. Grow the page only if the 
-    # third state does not fit in that tail. 
-    real_mamba_page_size = sum(mamba_sizes) 
-    base_padded_mamba_page_size = attn_page_size + conv_block_page_size 
-    padded_mamba_page_size = ( 
-        max(base_padded_mamba_page_size, real_mamba_page_size) 
-        if save_qwen35_g 
-        else base_padded_mamba_page_size 
-    )
-    if (
-        cache_config.mamba_page_size_padded is None
-        or cache_config.mamba_page_size_padded != padded_mamba_page_size
-    ):
-        cache_config.mamba_page_size_padded = padded_mamba_page_size 
-        if save_qwen35_g: 
-            padding_size = padded_mamba_page_size - real_mamba_page_size 
-            mamba_padding_pct = 100 * padding_size / padded_mamba_page_size 
+    if save_qwen35_g:
+        # The g sidecar is one value per token and local value head.
+        # Compute it after block_size has been finalized above.
+        cache_config.mamba_block_size = cache_config.block_size
+        hf_text_config = model_config.hf_text_config
+        local_num_v_heads = hf_text_config.linear_num_value_heads // parallel_config.tensor_parallel_size
+        g_shape = (cache_config.mamba_block_size, local_num_v_heads)
+        mamba_sizes.append(math.prod(g_shape) * get_dtype_size(torch.float32))
+        v_block_page_size = attn_page_size - cache_config.block_size * attn_single_token_k_page_size
+        if mamba_sizes[-1] > v_block_page_size:
+            raise ValueError(
+                f"Qwen3.5 g state requires {mamba_sizes[-1]} bytes per block, "
+                f"but the shared V block holds {v_block_page_size} bytes."
+            )
+
+    # Keep fixed [conv, K/SSM, V/g] bands. Growing the page to fit g would
+    # shift the FA K/V views rather than give g a larger per-block stride.
+    real_mamba_page_size = sum(mamba_sizes)
+    base_padded_mamba_page_size = attn_page_size + conv_block_page_size
+    padded_mamba_page_size = base_padded_mamba_page_size
+    if cache_config.mamba_page_size_padded is None or cache_config.mamba_page_size_padded != padded_mamba_page_size:
+        cache_config.mamba_page_size_padded = padded_mamba_page_size
+        if save_qwen35_g:
+            padding_size = padded_mamba_page_size - real_mamba_page_size
+            mamba_padding_pct = 100 * padding_size / padded_mamba_page_size
             logger.info(
                 "Padding mamba page size by %.2f%%; Qwen3.5 g KV cache enabled.",
                 mamba_padding_pct,

@@ -169,6 +169,50 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def reshape_hybrid_mamba_cache(
+    raw: torch.Tensor,
+    num_blocks: int,
+    shapes: tuple,
+    dtypes: tuple,
+    k_block_bytes: int,
+    v_block_bytes: int,
+) -> list[torch.Tensor]:
+    """Keep conv/SSM contiguous and map g into V with a V-block stride.
+
+    K blocks must equal SSM states in size. Only g has inter-block padding;
+    different physical block IDs stay disjoint across the shared views.
+    """
+    page_bytes = raw.numel() // num_blocks
+    conv_block_bytes = page_bytes - k_block_bytes - v_block_bytes
+    if conv_block_bytes < 0:
+        raise ValueError("Hybrid cache page cannot hold attention K and V blocks.")
+    strides_bytes = (conv_block_bytes, k_block_bytes, v_block_bytes)
+    offsets_bytes = (0, num_blocks * conv_block_bytes, num_blocks * (conv_block_bytes + k_block_bytes))
+    # Pure linear attention has SSM alone, without convolution state.
+    components = (1,) if len(shapes) == 1 and len(shapes[0]) == 3 else tuple(range(len(shapes)))
+    if len(shapes) != len(dtypes) or len(shapes) > len(strides_bytes):
+        raise ValueError("Unsupported hybrid Mamba state components.")
+    states = []
+    for component, shape, dtype in zip(components, shapes, dtypes):
+        item_bytes = get_dtype_size(dtype)
+        stride_bytes = strides_bytes[component]
+        offset_bytes = offsets_bytes[component]
+        state_bytes = math.prod(shape) * item_bytes
+        if stride_bytes < state_bytes or stride_bytes % item_bytes or offset_bytes % item_bytes:
+            raise ValueError(
+                f"Hybrid state {component} requires {state_bytes} bytes, but its block stride is {stride_bytes}."
+            )
+        if component < 2 and state_bytes != stride_bytes:
+            raise ValueError(f"Hybrid state {component} must exactly match its shared band block size.")
+        region = raw[offset_bytes : offset_bytes + num_blocks * stride_bytes].view(dtype)
+        if component < 2:
+            states.append(region.view(num_blocks, *shape))
+        else:
+            inner_strides = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
+            states.append(region.as_strided((num_blocks, *shape), (stride_bytes // item_bytes, *inner_strides)))
+    return states
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -3457,6 +3501,28 @@ class NPUModelRunner(GPUModelRunner):
                     # different memory capacities, `num_blocks` can be different on
                     # different GPUs, and `kv_cache_config.num_blocks` is set to
                     # the min of all `num_blocks`. Verify it here.
+
+                    if self.use_hybrid_blocks and self.hybrid_with_attn_and_mamba:
+                        shared_attention = next(
+                            (
+                                (name, spec) for name, spec in layer_kv_cache_spec.items()
+                                if isinstance(spec, AttentionSpec) and kv_cache_raw_tensors.get(name) is raw_tensor
+                            ),
+                            None,
+                        )
+                        if shared_attention is not None:
+                            attention_name, attention_spec = shared_attention
+                            k_dim, v_dim = self._get_attention_kv_cache_dims(attention_name, attention_spec)
+                            token_bytes = attention_spec.num_kv_heads * get_dtype_size(attention_spec.dtype)
+                            kv_caches[layer_name] = reshape_hybrid_mamba_cache(
+                                raw_tensor,
+                                num_blocks,
+                                current_kv_cache_spec.shapes,
+                                current_kv_cache_spec.dtypes,
+                                attention_spec.block_size * k_dim * token_bytes,
+                                attention_spec.block_size * v_dim * token_bytes,
+                            )
+                            continue
 
                     state_tensors = []
                     target_idx = 0
