@@ -43,7 +43,8 @@ from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_npu
 from vllm_ascend.utils import enable_sp
 
-logger = init_logger(__name__)
+# Inherit vLLM handlers (and UCM capture); vllm_ascend is a separate root.
+logger = init_logger("vllm.kvb.gdn")
 
 # ──────────────────────────────────────────────────────────────────
 # All-mode prefix caching helpers (P4)

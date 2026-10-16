@@ -70,7 +70,123 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 
-logger = init_logger(__name__)
+# Inherit vLLM handlers (and UCM capture); vllm_ascend is a separate root.
+logger = init_logger("vllm.kvb.fa")
+
+
+def supports_kvb_fa_reuse(impl, metadata):
+    """Only the eager, causal, unquantized paged FA path consumes KVB plans."""
+    return (
+        type(impl) is AscendAttentionBackendImpl
+        and type(metadata) is AscendMetadata
+        and not _EXTRA_CTX.capturing
+        and impl.attn_type == AttentionType.DECODER
+        and not impl.enable_hamming_sparse
+        and impl.sinks is None
+        and impl.sliding_window is None
+        and metadata.causal
+        and metadata.block_tables is not None
+    )
+
+
+def _prepare_kvb_fa_inputs(impl, layer_name, query, key, value, metadata):
+    """Merge owned historical K/V into projections; plan queries in original order."""
+    context = get_forward_context()
+    inputs = getattr(context, "kvb_gdn_inputs", None)
+    payload = getattr(context, "kvb_fa_reuse", {}).get(layer_name, {})
+    masks = getattr(context, "kvb_gdn_masks", {})
+    if inputs is None:
+        return key, value, None
+    has_skip = any(any(mask) for mask in masks.values())
+    if not payload and not has_skip:
+        return key, value, None
+    if not supports_kvb_fa_reuse(impl, metadata):
+        raise RuntimeError("KVB FA plan reached an unsupported attention path")
+    starts = inputs["query_start_loc"]
+    if (
+        list(metadata.actual_seq_lengths_q) != starts[1:]
+        or starts[-1] > query.shape[0]
+        or starts[-1] > key.shape[0]
+        or starts[-1] > value.shape[0]
+        or metadata.num_actual_tokens != starts[-1]
+        or len(metadata.seq_lens_list) != len(inputs["request_ids"])
+        or metadata.block_tables.shape[0] < len(inputs["request_ids"])
+    ):
+        raise ValueError("KVB FA query metadata does not match request ordering")
+    key, value = key.clone(), value.clone()
+    plan = []
+    for index, rid in enumerate(inputs["request_ids"]):
+        begin, end = starts[index : index + 2]
+        position = inputs["positions"][index]
+        count = end - begin
+        if metadata.seq_lens_list[index] != position + count:
+            raise ValueError("KVB FA KV length does not match absolute query positions")
+        covered = [False] * count
+        for span in payload.get(rid, ()):
+            first = max(position, span["start"])
+            last = min(position + count, span["start"] + span["key"].shape[0])
+            if first >= last:
+                continue
+            offset = first - span["start"]
+            target = begin + first - position
+            k = span["key"][offset : offset + last - first]
+            v = span["value"][offset : offset + last - first]
+            if k.shape != key[target : target + last - first].shape or v.shape != k.shape:
+                raise ValueError("KVB historical K/V shape does not match projections")
+            key[target : target + last - first].copy_(k)
+            value[target : target + last - first].copy_(v)
+            covered[first - position : last - position] = [True] * (last - first)
+        mask = list(masks.get(index, [False] * count))
+        if len(mask) != count or any(hit and not loaded for hit, loaded in zip(mask, covered)):
+            raise ValueError("KVB FA skip interval lacks loaded K/V")
+        prompt_length = inputs["prompt_lengths"][index]
+        if any(hit and position + offset >= prompt_length - 1 for offset, hit in enumerate(mask)):
+            raise ValueError("KVB FA cannot skip the final logits token or decode tokens")
+        computed, skipped, merged = [], [], []
+        for bits, hits, misses in ((mask, skipped, computed), (covered, merged, None)):
+            cursor = 0
+            while cursor < count:
+                stop = cursor + 1
+                while stop < count and bool(bits[stop]) == bool(bits[cursor]):
+                    stop += 1
+                if bits[cursor]:
+                    hits.append((position + cursor, position + stop))
+                elif misses is not None:
+                    misses.append((position + cursor, position + stop))
+                cursor = stop
+        plan.append(
+            {
+                "request_id": rid,
+                "index": index,
+                "begin": begin,
+                "position": position,
+                "count": count,
+                "computed": computed,
+                "skipped": skipped,
+                "merged": merged,
+            }
+        )
+    return key, value, plan
+
+
+def _log_kvb_fa_reuse(layer_name, plan):
+    """Log only after all planned FA calls and output writes have completed."""
+    for request in plan:
+        computed = sum(last - first for first, last in request["computed"])
+        logger.info(
+            "KVB EXEC FA request=%s layer=%s step=[%s,%s) scheduled=%s computed_query=%s "
+            "skipped_query=%s computed_ranges=%s skipped_ranges=%s merged_kv_ranges=%s mode=segmented",
+            request["request_id"],
+            layer_name,
+            request["position"],
+            request["position"] + request["count"],
+            request["count"],
+            computed,
+            request["count"] - computed,
+            request["computed"],
+            request["skipped"],
+            request["merged"],
+        )
 
 
 def _log_kvb_fa_execution(layer_name, query_tokens, attn_metadata):
@@ -1087,6 +1203,45 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event.record()
         return query, key, value, output
 
+    def _forward_kvb_fa(self, query, metadata, output, plan):
+        """Each miss interval is a suffix of its own causal KV prefix."""
+        queries, destinations, rows, query_ends, kv_lengths = [], [], [], [], []
+        total = 0
+        for request in plan:
+            for first, last in request["computed"]:
+                begin = request["begin"] + first - request["position"]
+                queries.append(query[begin : begin + last - first])
+                destinations.append(torch.arange(begin, begin + last - first, device=query.device))
+                rows.append(request["index"])
+                total += last - first
+                query_ends.append(total)
+                kv_lengths.append(last)
+        output.zero_()
+        if not queries:
+            return output
+        num_blocks, block_size, _, _ = self.key_cache.shape
+        row_indices = torch.tensor(rows, device=metadata.block_tables.device, dtype=torch.long)
+        block_tables = metadata.block_tables.index_select(0, row_indices).contiguous()
+        # sparse_mode=3 right-aligns each query segment with KV [0,last).
+        # Thus query [first,last) preserves its original causal token positions.
+        result, _ = torch_npu.npu_fused_infer_attention_score(
+            query=torch.cat(queries, dim=0).contiguous(),
+            key=self.key_cache.view(num_blocks, block_size, -1),
+            value=self.value_cache.view(num_blocks, block_size, -1),
+            atten_mask=metadata.attn_mask,
+            block_table=block_tables,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=query_ends,
+            actual_seq_lengths_kv=kv_lengths,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=3,
+        )
+        output.index_copy_(0, torch.cat(destinations), result.view(total, *output.shape[1:]))
+        return output
+
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1156,12 +1311,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             ):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
 
+        plan = None
+        if key is not None and value is not None:
+            key, value, plan = _prepare_kvb_fa_inputs(self, layer.layer_name, query, key, value, attn_metadata)
         output_padded = None
         if key is not None and value is not None:
             output_padded = output
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
+        if plan is not None:
+            self._forward_kvb_fa(query, attn_metadata, output, plan)
+            _log_kvb_fa_reuse(layer.layer_name, plan)
+            return output
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
