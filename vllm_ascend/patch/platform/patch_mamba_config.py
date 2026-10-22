@@ -74,7 +74,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
         and cache_config.mamba_cache_mode == "align"
     ):
         cache_config.mamba_cache_mode = "all"
-        logger.info("Restoring mamba_cache_mode='all' (NPU all-mode prefix caching is supported in vllm-ascend).")
 
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
@@ -156,26 +155,10 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
     # Keep fixed [conv, K/SSM, V/g] bands. Growing the page to fit g would
     # shift the FA K/V views rather than give g a larger per-block stride.
-    real_mamba_page_size = sum(mamba_sizes)
     base_padded_mamba_page_size = attn_page_size + conv_block_page_size
     padded_mamba_page_size = base_padded_mamba_page_size
     if cache_config.mamba_page_size_padded is None or cache_config.mamba_page_size_padded != padded_mamba_page_size:
         cache_config.mamba_page_size_padded = padded_mamba_page_size
-        if save_qwen35_g:
-            padding_size = padded_mamba_page_size - real_mamba_page_size
-            mamba_padding_pct = 100 * padding_size / padded_mamba_page_size
-            logger.info(
-                "Padding mamba page size by %.2f%%; Qwen3.5 g KV cache enabled.",
-                mamba_padding_pct,
-            )
-        else:
-            mamba_padding_pct = 100 * conv_block_page_size / padded_mamba_page_size
-            logger.info(
-                "Padding mamba page size by %.2f%% to ensure "
-                "that mamba page size and attention page size are "
-                "exactly equal.",
-                mamba_padding_pct,
-            )
     if (
         cache_config.mamba_cache_mode in ("align", "all")
         and (

@@ -170,53 +170,29 @@ def _prepare_kvb_fa_inputs(impl, layer_name, query, key, value, metadata):
 
 
 def _log_kvb_fa_reuse(layer_name, plan):
-    """Log only after all planned FA calls and output writes have completed."""
+    """Record actual merged K/V tokens for the single forward summary."""
+    stats = getattr(get_forward_context(), "kvb_reuse_stats", None)
+    if stats is None:
+        return
+    counts = stats.setdefault("fa", {}).setdefault(layer_name, {})
     for request in plan:
-        computed = sum(last - first for first, last in request["computed"])
-        logger.info(
-            "KVB EXEC FA request=%s layer=%s step=[%s,%s) scheduled=%s computed_query=%s "
-            "skipped_query=%s computed_ranges=%s skipped_ranges=%s merged_kv_ranges=%s mode=segmented",
-            request["request_id"],
-            layer_name,
-            request["position"],
-            request["position"] + request["count"],
-            request["count"],
-            computed,
-            request["count"] - computed,
-            request["computed"],
-            request["skipped"],
-            request["merged"],
+        counts[request["request_id"]] = sum(
+            last - first for first, last in request["merged"]
         )
 
 
 def _log_kvb_fa_execution(layer_name, query_tokens, attn_metadata):
-    """Report queries actually dispatched by the unmasked FA path, not hits."""
+    """An ordinary FA forward did not consume historical K/V."""
     context = get_forward_context()
     inputs = getattr(context, "kvb_gdn_inputs", None)
-    if inputs is None:
+    stats = getattr(context, "kvb_reuse_stats", None)
+    if inputs is None or stats is None:
         return
     query_ends = attn_metadata.actual_seq_lengths_q
     query_tokens = min(query_tokens, query_ends[-1])
     if list(query_ends) != inputs["query_start_loc"][1:] or query_tokens != inputs["query_start_loc"][-1]:
-        logger.info(
-            "KVB EXEC FA layer=%s actual_query_tokens=%s skipped_query=0 request_range_mapping=unavailable",
-            layer_name, query_tokens,
-        )
         return
-    masks = getattr(context, "compute_masks", {})
-    for index, request_id in enumerate(inputs["request_ids"]):
-        begin, end = inputs["query_start_loc"][index : index + 2]
-        if begin == end:
-            continue
-        start = inputs["positions"][index]
-        mask = masks.get(index)
-        candidate_tokens = int(mask.sum()) if mask is not None else 0
-        logger.info(
-            "KVB EXEC FA request=%s layer=%s step=[%s,%s) scheduled=%s computed_query=%s "
-            "skipped_query=0 mask_candidate_tokens=%s computed_ranges=%s mode=dense_mask_not_consumed",
-            request_id, layer_name, start, start + end - begin, end - begin, end - begin,
-            candidate_tokens, [(start, start + end - begin)],
-        )
+    stats.setdefault("fa", {})[layer_name] = dict.fromkeys(inputs["request_ids"], 0)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")

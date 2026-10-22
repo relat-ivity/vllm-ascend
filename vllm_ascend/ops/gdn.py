@@ -478,6 +478,10 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
     context.kvb_gdn_inputs = None
     context.kvb_gdn_cross_step_inputs = {}
     context.kvb_gdn_allow_reuse = enabled if allow_reuse is None else allow_reuse
+    context.kvb_reuse_stats = {}
+    context.kvb_reuse_block_size = None
+    context.kvb_reuse_log_rank = 0
+    context.kvb_reuse_request_ids = None
     if enabled:
         count = len(input_batch.req_ids)
         context.kvb_gdn_inputs = {
@@ -488,10 +492,31 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
         }
     try:
         yield
+        block_size = context.kvb_reuse_block_size
+        if enabled and block_size and context.kvb_reuse_log_rank == 0:
+            inputs = context.kvb_gdn_inputs
+            for index, request_id in enumerate(inputs["request_ids"]):
+                if context.kvb_reuse_request_ids is not None and request_id not in context.kvb_reuse_request_ids:
+                    continue
+                begin, end = inputs["query_start_loc"][index : index + 2]
+                if begin == end or inputs["positions"][index] >= inputs["prompt_lengths"][index]:
+                    continue
+                blocks = []
+                for kind in ("fa", "mamba"):
+                    counts = context.kvb_reuse_stats.get(kind, {}).values()
+                    # A layer/rank is not another reused copy of the same text.
+                    tokens = min((layer.get(request_id, 0) for layer in counts), default=0)
+                    blocks.append(tokens / block_size)
+                logger.info(
+                    "KVB REUSE request=%s fa_blocks=%g mamba_blocks=%g",
+                    request_id, *blocks,
+                )
     finally:
         context.kvb_gdn_meta = {}
         context.kvb_gdn_inputs = None
         context.kvb_gdn_cross_step_inputs = {}
+        context.kvb_reuse_stats = None
+        context.kvb_reuse_request_ids = None
 
 
 def compose_reused_gdn_states(clean, log_decay, initial):
@@ -561,17 +586,14 @@ def build_gdn_segment_metadata(base, *, start, length, source, destination, is_p
     return meta
 
 
-def _log_kvb_gdn_execution(layer, request_id, start, end, computed, composed, carried=()):
-    """Report executed host-side branches without synchronizing the device."""
-    computed_tokens = sum(last - first for first, last in computed)
+def _log_kvb_gdn_execution(layer, request_id, composed, carried=(), *, context):
+    """Record actual reused tokens; emit no per-layer diagnostics."""
+    stats = getattr(context, "kvb_reuse_stats", None)
+    if stats is None:
+        return
     composed_tokens = sum(last - first for first, last in composed)
     carried_tokens = sum(last - first for first, last in carried)
-    logger.info(
-        "KVB EXEC GDN request=%s layer=%s step=[%s,%s) scheduled=%s computed=%s "
-        "composed=%s carried=%s skipped_dense=%s computed_ranges=%s composed_ranges=%s carried_ranges=%s",
-        request_id, layer.prefix, start, end, end - start, computed_tokens,
-        composed_tokens, carried_tokens, composed_tokens + carried_tokens, computed, composed, carried,
-    )
+    stats.setdefault("mamba", {}).setdefault(layer.prefix, {})[request_id] = composed_tokens + carried_tokens
 
 
 def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
@@ -601,7 +623,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
             is_prefill = position < inputs["prompt_lengths"][index]
             source = sources[index] if has_initial[index] else -1
             hits = layer_hits.get(request_id, ())
-            computed, composed = [], []
+            composed = []
             for first, last, hit in iter_compute_and_reuse_segments(
                 position, token_end - token_start, base.mamba_block_size, hits
             ):
@@ -629,10 +651,9 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
                 context.attn_metadata = {layer.prefix: meta}
                 begin = token_start + first - position
                 dense_forward(hidden_states[begin : begin + last - first], output[begin : begin + last - first])
-                computed.append((first, last))
                 source = destination
             _log_kvb_gdn_execution(
-                layer, request_id, position, position + token_end - token_start, computed, composed
+                layer, request_id, composed, context=context,
             )
     finally:
         context.attn_metadata = original
@@ -671,7 +692,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 if cross_step_state is not None else start
             )
             compute_start = min(step_end, max(start, carry_end))
-            computed, composed = [], []
+            composed = []
             carried = [(start, compute_start)] if compute_start > start else []
             # Validate the complete execution plan before modifying any cache.
             segments = list(iter_compute_and_reuse_segments(
@@ -758,7 +779,6 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 context.attn_metadata = {layer.prefix: meta}
                 token = begin + first - start
                 dense_forward(hidden_states[token : token + last - first], output[token : token + last - first])
-                computed.append((first, last))
                 has_initial = True
                 if destination not in protected_state_slot_ids:
                     state[destination].copy_(state_work[0])
@@ -766,7 +786,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                     saved_continuation = True
             if cross_step_state is not None and saved_continuation:
                 cross_step_state["consumed_layer_names"].add(layer.prefix)
-            _log_kvb_gdn_execution(layer, rid, start, step_end, computed, composed, carried)
+            _log_kvb_gdn_execution(layer, rid, composed, carried, context=context)
     finally:
         context.attn_metadata = original
         context.kvb_gdn_work_cache = previous_work
@@ -864,11 +884,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         inputs = getattr(context, "kvb_gdn_inputs", None)
         if inputs is not None:
             for index, request_id in enumerate(inputs["request_ids"]):
-                start = inputs["positions"][index]
                 begin, end = inputs["query_start_loc"][index : index + 2]
                 if end > begin:
                     _log_kvb_gdn_execution(
-                        self, request_id, start, start + end - begin, [(start, start + end - begin)], []
+                        self, request_id, [], context=context,
                     )
 
     def _forward_dense(self, hidden_states, output, *, segmented=False):
