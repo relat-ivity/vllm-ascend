@@ -313,9 +313,10 @@ def _run_all_mode_non_spec_conv1d(
 
     if num_decodes > 0:
         conv_state = conv_state_raw.transpose(-1, -2)
-        src_slots = attn_metadata.block_state_indices[:num_decodes]
-        dst_slots = non_spec_state_indices_tensor[:num_decodes]
-        _copy_slots_if_needed(conv_state, src_slots, dst_slots)
+        if not getattr(attn_metadata, "skip_state_copy", False):
+            src_slots = attn_metadata.block_state_indices[:num_decodes]
+            dst_slots = non_spec_state_indices_tensor[:num_decodes]
+            _copy_slots_if_needed(conv_state, src_slots, dst_slots)
         return causal_conv1d_update_npu(
             mixed_qkv_non_spec,
             conv_state,
@@ -385,9 +386,10 @@ def _run_all_mode_non_spec_recurrent(
         return core_attn_out_non_spec, last_recurrent_state
 
     if num_decodes > 0:
-        src_slots = attn_metadata.block_state_indices[:num_decodes]
-        dst_slots = non_spec_state_indices_tensor[:num_decodes]
-        _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
+        if not getattr(attn_metadata, "skip_state_copy", False):
+            src_slots = attn_metadata.block_state_indices[:num_decodes]
+            dst_slots = non_spec_state_indices_tensor[:num_decodes]
+            _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
         if use_torch_npu_kernel:
             cu_seqlens = non_spec_query_start_loc[: num_decodes + 1]
             actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -554,6 +556,8 @@ def build_gdn_segment_metadata(base, *, start, length, source, destination, is_p
     indices after token slicing. The eager FLA kernel builds its own chunk meta.
     """
     meta = copy(base)
+    # Segments replace SOURCE/DEST slots, invalidating the whole-batch proof.
+    meta.skip_state_copy = False
     meta.num_decodes = int(not is_prefill)
     meta.num_prefills = int(is_prefill)
     meta.num_actual_tokens = length
@@ -1298,7 +1302,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             elif attn_metadata.num_decodes > 0:
                 core_attn_out_spec = None
                 # All-mode: pre-copy SOURCE → DEST before in-place kernel
-                if is_all_mode:
+                if is_all_mode and not getattr(attn_metadata, "skip_state_copy", False):
                     src_slots = attn_metadata.block_state_indices
                     dst_slots = non_spec_state_indices_tensor
                     _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
