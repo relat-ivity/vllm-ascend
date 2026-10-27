@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
+from vllm.config import CUDAGraphMode
 from vllm.logger import logger
 
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
@@ -751,12 +752,21 @@ def _warn_all_mode_spec_fallback_once() -> None:
 def _can_skip_decode_state_copy(builder, attn_metadata, common_attn_metadata) -> bool:
     """Prove equal SOURCE/DEST blocks using existing, corrected CPU metadata.
 
-    Keep data-dependent host decisions out of captured graphs. Missing CPU
-    mirrors, one-token prefills and speculative batches retain the old path.
+    Host decisions are safe in eager, or piecewise mode with GDN explicitly
+    split out of the captured graphs. Full graphs, missing CPU mirrors,
+    one-token prefills and speculative batches retain the old path.
     """
     config = builder.vllm_config
-    if not getattr(config.model_config, "enforce_eager", False) or config.speculative_config is not None:
+    if config.speculative_config is not None:
         return False
+    if not getattr(config.model_config, "enforce_eager", False):
+        compilation = getattr(config, "compilation_config", None)
+        if (
+            compilation is None
+            or compilation.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            or "vllm::gdn_attention_core" not in (compilation.splitting_ops or ())
+        ):
+            return False
     count = attn_metadata.num_decodes
     if (
         count <= 0
