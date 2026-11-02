@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
@@ -534,6 +535,47 @@ def _build_non_spec_chunked_prefill_meta_cpu(builder, cu_seqlens_cpu: torch.Tens
     tensors = _allocate_chunk_meta_cpu_tensors(shape_info)
     _fill_chunk_meta_cpu_tensors(tensors, shape_info)
     return _build_chunked_prefill_metadata(builder, tensors)
+
+
+def build_gdn_segment_chunk_meta(length: int, num_heads: int, device: torch.device) -> GDNChunkedPrefillMetadata:
+    """Build a single-sequence segment's indices without reading device lengths.
+
+    The segment length and local value-head count are already known on the host.
+    Pack all six metadata tensors into one transfer; returned views are read-only
+    and can be reused by equal-length segments across GDN layers in this forward.
+    """
+    if length <= 0 or num_heads <= 0:
+        raise ValueError("GDN segment length and local head count must be positive")
+    builder = SimpleNamespace(
+        _ascend_gdn_chunk_size=_GDN_CHUNK_SIZE,
+        _ascend_gdn_large_block_size=_GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE,
+        _ascend_gdn_cumsum_block_size=_next_power_of_2(
+            max(1, _GDN_CUMSUM_WORKING_SET // (num_heads * _GDN_CHUNK_SIZE))
+        ),
+    )
+    host = _build_non_spec_chunked_prefill_meta_cpu(
+        builder, torch.tensor([0, length], dtype=torch.int32, device="cpu")
+    )
+    tensors = {
+        name: getattr(host, name)
+        for name in (
+            "chunk_indices_chunk64",
+            "chunk_offsets_chunk64",
+            "update_chunk_offsets_chunk64",
+            "final_chunk_indices_chunk64",
+            "chunk_indices_large_block",
+            "block_indices_cumsum",
+        )
+    }
+    packed_host = torch.cat([tensor.reshape(-1) for tensor in tensors.values()])
+    packed_device = packed_host.to(device=device, non_blocking=True)
+    views = {}
+    offset = 0
+    for name, tensor in tensors.items():
+        views[name] = packed_device[offset : offset + tensor.numel()].view(tensor.shape)
+        offset += tensor.numel()
+    # Keep the host allocation alive until the forward's asynchronous copy ends.
+    return GDNChunkedPrefillMetadata(**views, _buffer_slot=packed_host)
 
 
 def _build_non_spec_chunked_prefill_meta(

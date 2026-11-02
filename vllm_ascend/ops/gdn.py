@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import logging
 from contextlib import contextmanager
 from copy import copy
 from types import SimpleNamespace
@@ -67,6 +68,37 @@ def _copy_slots_if_needed(
     src = src_slots.index_select(0, copy_idx).long()
     dst = dst_slots.index_select(0, copy_idx).long()
     state_pool[dst] = state_pool[src]
+
+
+def _log_decode_state_copy_dispatch(layer, attn_metadata, context) -> None:
+    """Log the consumed flag, once per reason on the first decode GDN layer.
+
+    Only inspect host metadata. Do not print or transfer SOURCE/DEST tensors.
+    This is a dispatch diagnostic, not proof of a full graph replay.
+    """
+    if not getattr(attn_metadata, "is_all_mode", False) or attn_metadata.num_decodes <= 0:
+        return
+    owner = getattr(context, "_gdn_state_copy_log_owner", None)
+    if owner is None:
+        context._gdn_state_copy_log_owner = layer.prefix
+    elif owner != layer.prefix:
+        return
+    skip = getattr(attn_metadata, "skip_state_copy", False)
+    reason = getattr(attn_metadata, "skip_state_copy_reason", "missing_reason")
+    key = (skip, reason)
+    seen = getattr(layer, "_decode_state_copy_logged", None)
+    if seen is None:
+        seen = layer._decode_state_copy_logged = set()
+    if key in seen or len(seen) >= 12:
+        return
+    seen.add(key)
+    logger.info(
+        "GDN STATE COPY dispatch layer=%s skip_state_copy=%s copy_check=%s "
+        "reason=%s runtime_mode=%s num_decodes=%s num_prefills=%s file=%s",
+        layer.prefix, skip, "bypassed" if skip else "enabled", reason,
+        getattr(context, "cudagraph_runtime_mode", None),
+        attn_metadata.num_decodes, attn_metadata.num_prefills, __file__,
+    )
 
 
 def _build_initial_state(
@@ -479,6 +511,8 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
     context.kvb_gdn_meta = {}
     context.kvb_gdn_inputs = None
     context.kvb_gdn_cross_step_inputs = {}
+    context.kvb_gdn_segment_chunk_meta = {}
+    context.kvb_gdn_plan_log_owner = None
     context.kvb_gdn_allow_reuse = enabled if allow_reuse is None else allow_reuse
     context.kvb_reuse_stats = {}
     context.kvb_reuse_block_size = None
@@ -517,6 +551,8 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
         context.kvb_gdn_meta = {}
         context.kvb_gdn_inputs = None
         context.kvb_gdn_cross_step_inputs = {}
+        context.kvb_gdn_segment_chunk_meta = None
+        context.kvb_gdn_plan_log_owner = None
         context.kvb_reuse_stats = None
         context.kvb_reuse_request_ids = None
 
@@ -549,15 +585,33 @@ def iter_compute_and_reuse_segments(start, length, block_size, hits, *, allow_ah
         cursor = stop
 
 
-def build_gdn_segment_metadata(base, *, start, length, source, destination, is_prefill, device):
+def get_kvb_gdn_segment_chunk_meta(context, length, num_heads, device):
+    """Share immutable segment indices across layers, bounded to this forward."""
+    # Lazy import avoids a worker-patch/custom-op import cycle during startup.
+    from vllm_ascend.patch.worker.patch_gdn_attn import build_gdn_segment_chunk_meta
+
+    cache = getattr(context, "kvb_gdn_segment_chunk_meta", None)
+    if cache is None:
+        context.kvb_gdn_segment_chunk_meta = cache = {}
+    key = (length, num_heads, torch.device(device))
+    if key not in cache:
+        cache[key] = build_gdn_segment_chunk_meta(length, num_heads, torch.device(device))
+    return cache[key]
+
+
+def build_gdn_segment_metadata(base, *, start, length, source, destination, is_prefill, device, chunk_meta=None):
     """One physical block per kernel call: final write is its checkpoint.
 
     Building fresh sequence metadata avoids using whole-batch scatter/chunk
-    indices after token slicing. The eager FLA kernel builds its own chunk meta.
+    indices after token slicing. Prefill uses prebuilt single-sequence chunk
+    indices, not the whole-batch metadata or the FLA host-readback fallback.
     """
+    if is_prefill and chunk_meta is None:
+        raise ValueError("KVB prefill segments require prebuilt chunk metadata")
     meta = copy(base)
     # Segments replace SOURCE/DEST slots, invalidating the whole-batch proof.
     meta.skip_state_copy = False
+    meta.skip_state_copy_reason = "segmented_metadata"
     meta.num_decodes = int(not is_prefill)
     meta.num_prefills = int(is_prefill)
     meta.num_actual_tokens = length
@@ -577,7 +631,7 @@ def build_gdn_segment_metadata(base, *, start, length, source, destination, is_p
     meta.scatter_dst_slots_tensor = None
     meta.conv_scatter_end_indices_tensor = None
     meta.non_spec_prefill_fallback_meta = SimpleNamespace(
-        chunk=None,
+        chunk=chunk_meta,
         causal_conv1d=SimpleNamespace(
             query_start_loc_cpu=torch.tensor([0, length], dtype=torch.int32),
             cache_indices_cpu=torch.tensor([destination], dtype=torch.int32),
@@ -598,6 +652,28 @@ def _log_kvb_gdn_execution(layer, request_id, composed, carried=(), *, context):
     composed_tokens = sum(last - first for first, last in composed)
     carried_tokens = sum(last - first for first, last in carried)
     stats.setdefault("mamba", {}).setdefault(layer.prefix, {})[request_id] = composed_tokens + carried_tokens
+
+
+def _log_kvb_gdn_plan(layer, request_id, start, length, block_size, segments, *, context, carried=()):
+    """Report actual core-call intervals on the first GDN layer of TP rank zero."""
+    if not logger.isEnabledFor(logging.DEBUG) or getattr(context, "kvb_reuse_log_rank", 0) != 0:
+        return
+    owner = getattr(context, "kvb_gdn_plan_log_owner", None)
+    if owner is None:
+        context.kvb_gdn_plan_log_owner = layer.prefix
+    elif owner != layer.prefix:
+        return
+    step_end = start + length
+    computed = [(first, last) for first, last, hit in segments if hit is None]
+    reused = list(carried) + [
+        (first, min(last, step_end)) for first, last, hit in segments if hit is not None
+    ]
+    logger.debug(
+        "KVB GDN PLAN request=%s layer=%s step=[%d,%d) block_size=%d "
+        "core_calls=%d compute=%s reuse=%s",
+        request_id, layer.prefix, start, step_end, block_size,
+        len(computed), computed, reused,
+    )
 
 
 def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
@@ -628,9 +704,16 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
             source = sources[index] if has_initial[index] else -1
             hits = layer_hits.get(request_id, ())
             composed = []
-            for first, last, hit in iter_compute_and_reuse_segments(
+            segments = iter_compute_and_reuse_segments(
                 position, token_end - token_start, base.mamba_block_size, hits
-            ):
+            )
+            if is_prefill and logger.isEnabledFor(logging.DEBUG):
+                segments = list(segments)
+                _log_kvb_gdn_plan(
+                    layer, request_id, position, token_end - token_start,
+                    base.mamba_block_size, segments, context=context,
+                )
+            for first, last, hit in segments:
                 if hit is not None:
                     initial = state[source].clone() if source >= 0 else torch.zeros_like(state[0])
                     slots = hit["destination_block_ids"]
@@ -650,6 +733,10 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
                     destination=destination,
                     is_prefill=is_prefill,
                     device=hidden_states.device,
+                    chunk_meta=(
+                        get_kvb_gdn_segment_chunk_meta(context, last - first, g.shape[-1], hidden_states.device)
+                        if is_prefill else None
+                    ),
                 )
                 # chunk_gated_delta_rule also reads the FIRST layer metadata.
                 context.attn_metadata = {layer.prefix: meta}
@@ -702,6 +789,11 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             segments = list(iter_compute_and_reuse_segments(
                 compute_start, step_end - compute_start, block_size, hits, allow_ahead=True
             ))
+            if start < inputs["prompt_lengths"][index]:
+                _log_kvb_gdn_plan(
+                    layer, rid, start, end - begin, block_size, segments,
+                    context=context, carried=carried,
+                )
             conv_work = torch.zeros_like(conv[:1])
             state_work = torch.zeros_like(state[:1])
             has_initial = False
@@ -775,6 +867,10 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                     destination=0,
                     is_prefill=is_prefill,
                     device=hidden_states.device,
+                    chunk_meta=(
+                        get_kvb_gdn_segment_chunk_meta(context, last - first, g.shape[-1], hidden_states.device)
+                        if is_prefill else None
+                    ),
                 )
                 # Only conv/recurrent state uses slot zero in scratch. g still
                 # writes the registered pool under the original physical mapping.
@@ -983,6 +1079,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        _log_decode_state_copy_dispatch(self, attn_metadata, forward_context)
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
