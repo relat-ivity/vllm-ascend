@@ -51,6 +51,7 @@ class GDNChunkedPrefillMetadata:
     chunk_indices_large_block: torch.Tensor
     block_indices_cumsum: torch.Tensor
     _buffer_slot: object | None = None
+    cu_seqlens: torch.Tensor | None = None
 
 
 @dataclass
@@ -537,14 +538,17 @@ def _build_non_spec_chunked_prefill_meta_cpu(builder, cu_seqlens_cpu: torch.Tens
     return _build_chunked_prefill_metadata(builder, tensors)
 
 
-def build_gdn_segment_chunk_meta(length: int, num_heads: int, device: torch.device) -> GDNChunkedPrefillMetadata:
-    """Build a single-sequence segment's indices without reading device lengths.
+def build_gdn_segment_chunk_meta(
+    length: int | tuple[int, ...], num_heads: int, device: torch.device
+) -> GDNChunkedPrefillMetadata:
+    """Build packed segment indices without reading device lengths.
 
     The segment length and local value-head count are already known on the host.
     Pack all six metadata tensors into one transfer; returned views are read-only
     and can be reused by equal-length segments across GDN layers in this forward.
     """
-    if length <= 0 or num_heads <= 0:
+    lengths = (length,) if isinstance(length, int) else length
+    if not lengths or min(lengths) <= 0 or num_heads <= 0:
         raise ValueError("GDN segment length and local head count must be positive")
     builder = SimpleNamespace(
         _ascend_gdn_chunk_size=_GDN_CHUNK_SIZE,
@@ -553,9 +557,11 @@ def build_gdn_segment_chunk_meta(length: int, num_heads: int, device: torch.devi
             max(1, _GDN_CUMSUM_WORKING_SET // (num_heads * _GDN_CHUNK_SIZE))
         ),
     )
-    host = _build_non_spec_chunked_prefill_meta_cpu(
-        builder, torch.tensor([0, length], dtype=torch.int32, device="cpu")
-    )
+    starts = [0]
+    for size in lengths:
+        starts.append(starts[-1] + size)
+    cu_seqlens = torch.tensor(starts, dtype=torch.int32, device="cpu")
+    host = _build_non_spec_chunked_prefill_meta_cpu(builder, cu_seqlens)
     tensors = {
         name: getattr(host, name)
         for name in (
@@ -567,6 +573,8 @@ def build_gdn_segment_chunk_meta(length: int, num_heads: int, device: torch.devi
             "block_indices_cumsum",
         )
     }
+    if len(lengths) > 1:
+        tensors["cu_seqlens"] = cu_seqlens
     packed_host = torch.cat([tensor.reshape(-1) for tensor in tensors.values()])
     packed_device = packed_host.to(device=device, non_blocking=True)
     views = {}

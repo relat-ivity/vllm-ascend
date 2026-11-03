@@ -28,33 +28,10 @@ from .utils import input_guard, prepare_final_chunk_indices
 from .wy_fast import recompute_w_u_fwd
 
 
-def chunk_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None = None,
-    prebuilt_meta=None,
-    return_intermediate_states: bool = False,
-    state_dtype: torch.dtype | None = None,
-):
-    forward_context = get_forward_context()
-    num_decodes = 0
-    attn_metadata = forward_context.attn_metadata
-    if attn_metadata is not None and isinstance(attn_metadata, dict):
-        attn_metadata = next(iter(attn_metadata.values()), None)
-    if attn_metadata is not None:
-        num_decodes = attn_metadata.num_decodes
+def prepare_chunk_gdn_wy(k, v, g, beta, cu_seqlens, prebuilt_meta):
     chunk_size = 64
     block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
-    chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_chunk64
-    update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
-    final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
     g = chunk_local_cumsum(
         g,
@@ -87,6 +64,33 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices_chunk64,
     )
+    return g, A, w, u
+
+
+def chunk_gated_delta_rule_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None = None,
+    prebuilt_meta=None,
+    return_intermediate_states: bool = False,
+    state_dtype: torch.dtype | None = None,
+):
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = next(iter(attn_metadata.values()), None)
+    num_decodes = 0 if attn_metadata is None else attn_metadata.num_decodes
+    chunk_size = 64
+    chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
+    chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_chunk64
+    update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
+    final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
+    g, A, w, u = prepare_chunk_gdn_wy(k, v, g, beta, cu_seqlens, prebuilt_meta)
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,

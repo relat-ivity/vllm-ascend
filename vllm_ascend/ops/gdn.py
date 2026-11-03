@@ -36,8 +36,11 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
-from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule, prepare_chunk_gdn_wy
+from vllm_ascend.ops.triton.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from vllm_ascend.ops.triton.fla.chunk_o import chunk_fwd_o
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.l2norm import l2norm_fwd as chunk_l2norm_fwd
 from vllm_ascend.ops.triton.fla.sigmoid_gating import fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
@@ -744,13 +747,13 @@ def _log_kvb_gdn_plan(layer, request_id, start, length, block_size, segments, *,
     )
 
 
-def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
+def run_segmented_gdn(layer, hidden_states, output, context, dense_forward, packed_forward=None):
     """Run original GDN kernels only on misses and compose all hit checkpoints."""
     layer_hits = context.kvb_gdn_meta.get(layer.prefix, {})
     if getattr(context, "kvb_gdn_cross_step_inputs", {}).get(layer.prefix) or any(
         span["destination_start"] % span["block_size"] for spans in layer_hits.values() for span in spans
     ) or has_private_gdn_prefill(context, layer.prefix):
-        return _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dense_forward)
+        return _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dense_forward, packed_forward)
     inputs = context.kvb_gdn_inputs
     original = context.attn_metadata
     base = original[layer.prefix]
@@ -811,7 +814,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
         context.attn_metadata = original
 
 
-def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dense_forward):
+def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dense_forward, packed_forward=None):
     """Use scratch state until a writable target checkpoint is reached."""
     original = context.attn_metadata
     previous_work = getattr(context, "kvb_gdn_work_cache", None)
@@ -823,6 +826,11 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
     block_size = base.mamba_block_size
     tables, sources, initialized = get_kvb_gdn_host_metadata(context, base)
     cache_write_limits = getattr(context, "kvb_gdn_cache_write_limits", {})
+
+    def write_checkpoint(destination, recurrent_state, conv_state):
+        state[destination].copy_(recurrent_state)
+        conv[destination].copy_(conv_state)
+
     output.zero_()
     try:
         for index, rid in enumerate(inputs["request_ids"]):
@@ -832,6 +840,8 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             begin, end = inputs["query_start_loc"][index : index + 2]
             if begin == end:
                 continue
+            is_prefill = start < inputs["prompt_lengths"][index]
+            source = sources[index] if initialized[index] else -1
             table = tables[index]
             hits = layer_hits.get(rid, ())
             step_end = start + end - begin
@@ -846,13 +856,39 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             # Validate the complete execution plan before modifying any cache.
             segments = list(iter_compute_and_reuse_segments(
                 compute_start, step_end - compute_start, block_size, hits, allow_ahead=True,
-                merge_compute_from=cache_write_limit if start < inputs["prompt_lengths"][index] else None,
+                merge_compute_from=cache_write_limit if is_prefill else None,
             ))
-            if start < inputs["prompt_lengths"][index]:
+            if is_prefill:
                 _log_kvb_gdn_plan(
                     layer, rid, start, end - begin, block_size, segments,
                     context=context, carried=carried,
                 )
+            if (
+                packed_forward is not None
+                and private
+                and is_prefill
+                and cache_write_limit <= start
+                and cross_step_state is None
+                and len(segments) == 3
+                and segments[0][2] is None
+                and segments[1][2] is not None
+                and "next_step_state" not in segments[1][2]
+                and segments[2][2] is None
+            ):
+                hit_start, hit_end, hit = segments[1]
+                left_end = begin + hit_start - start
+                right_begin = begin + hit_end - start
+                lengths = (left_end - begin, end - right_begin)
+                packed = torch.cat((hidden_states[begin:left_end], hidden_states[right_begin:end]))
+                packed_output = output.new_empty((sum(lengths), *output.shape[1:]))
+                final_state, final_conv = packed_forward(
+                    packed, packed_output, kvb_pair=(lengths, source, hit),
+                )
+                output[begin:left_end].copy_(packed_output[:lengths[0]])
+                output[right_begin:end].copy_(packed_output[lengths[0]:])
+                write_checkpoint(table[(step_end - 1) // block_size], final_state, final_conv)
+                _log_kvb_gdn_execution(layer, rid, [(hit_start, hit_end)], context=context)
+                continue
             conv_work = torch.zeros_like(conv[:1])
             state_work = torch.zeros_like(state[:1])
             has_initial = False
@@ -860,28 +896,24 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 state_work[0].copy_(cross_step_state["layers"][layer.prefix]["state"])
                 conv_work[0].copy_(cross_step_state["layers"][layer.prefix]["conv"])
                 has_initial = True
-            elif initialized[index] and sources[index] >= 0:
-                state_work[0].copy_(state[sources[index]])
-                conv_work[0].copy_(conv[sources[index]])
+            elif source >= 0:
+                state_work[0].copy_(state[source])
+                conv_work[0].copy_(conv[source])
                 has_initial = True
             # Source slots may include the pool slot used for this step's input.
             # Capture that input above BEFORE installing historical checkpoints.
-            protected_state_slot_ids = set()
-            published_hits = () if private else hits
-            for hit in published_hits:
-                if hit["destination_start"] % block_size:
-                    protected_state_slot_ids.update(hit["destination_block_ids"])
+            shifted_hits = () if private else [hit for hit in hits if hit["destination_start"] % block_size]
+            protected_state_slot_ids = {slot for hit in shifted_hits for slot in hit["destination_block_ids"]}
             if segments and not private:
                 _, final_last, final_hit = segments[-1]
                 if (final_hit is not None and final_last % block_size and "next_step_state" not in final_hit) or (
                     final_hit is None and table[(final_last - 1) // block_size] in protected_state_slot_ids
                 ):
                     raise ValueError("KVB shifted reuse must finish at a writable block checkpoint")
-            for hit in published_hits:
-                if hit["destination_start"] % block_size:
-                    slots = hit["destination_block_ids"]
-                    state[slots] = hit["source_states"].to(state.dtype)
-                    conv[slots] = hit["conv"].to(conv.dtype)
+            for hit in shifted_hits:
+                slots = hit["destination_block_ids"]
+                state[slots] = hit["source_states"].to(state.dtype)
+                conv[slots] = hit["conv"].to(conv.dtype)
             context.kvb_gdn_work_cache = (conv_work, state_work, g)
             if cross_step_state is not None and not private:
                 positions = torch.arange(start, compute_start, device=g.device, dtype=torch.long)
@@ -890,7 +922,6 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 g[physical, positions % block_size] = cross_step_state["layers"][layer.prefix]["g"][
                     offset : offset + compute_start - start
                 ].to(g.dtype)
-            is_prefill = start < inputs["prompt_lengths"][index]
             saved_continuation = False
             for first, last, hit in segments:
                 if hit is not None:
@@ -946,8 +977,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 dense_forward(hidden_states[token : token + last - first], output[token : token + last - first])
                 has_initial = True
                 if publish and destination not in protected_state_slot_ids:
-                    state[destination].copy_(state_work[0])
-                    conv[destination].copy_(conv_work[0])
+                    write_checkpoint(destination, state_work[0], conv_work[0])
                     saved_continuation = True
             if private:
                 # Keep only the live endpoint for the next step/decode. An
@@ -955,9 +985,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 # until scheduled tokens catch up to that endpoint.
                 working_end = segments[-1][1] if segments else carry_end
                 if working_end == step_end:
-                    destination = table[(step_end - 1) // block_size]
-                    state[destination].copy_(state_work[0])
-                    conv[destination].copy_(conv_work[0])
+                    write_checkpoint(table[(step_end - 1) // block_size], state_work[0], conv_work[0])
                     saved_continuation = True
             if cross_step_state is not None and saved_continuation:
                 cross_step_state["consumed_layer_names"].add(layer.prefix)
@@ -1052,6 +1080,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output,
                 context,
                 lambda hidden, out: self._forward_dense(hidden, out, segmented=True),
+                packed_forward=None if self.gqa_interleaved_layout else self._forward_dense,
             )
             # Save eligible requests after their computed checkpoints are ready.
             maybe_save_kv_layer_to_connector("", [])
@@ -1066,7 +1095,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         self, request_id, [], context=context,
                     )
 
-    def _forward_dense(self, hidden_states, output, *, segmented=False):
+    def _forward_dense(self, hidden_states, output, *, segmented=False, kvb_pair=None):
         """
         Forward pass with three parts:
         1. Input projection
@@ -1104,27 +1133,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        if segmented:
-            self._forward_core(mixed_qkv, b, a, core_attn_out)
+        if kvb_pair is not None:
+            core_attn_out, final_state, final_conv = self._forward_kvb_pair(mixed_qkv, b, a, *kvb_pair)
         else:
-            torch.ops.vllm.gdn_attention_core(
-                mixed_qkv,
-                b,
-                a,
-                core_attn_out,
-                self.prefix,
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
             )
+            if segmented:
+                self._forward_core(mixed_qkv, b, a, core_attn_out)
+            else:
+                torch.ops.vllm.gdn_attention_core(mixed_qkv, b, a, core_attn_out, self.prefix)
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        if not segmented:
+        if not segmented and kvb_pair is None:
             maybe_save_kv_layer_to_connector("", [])
         z_shape_og = z.shape
         # Reshape input data into 2D tensor
@@ -1134,6 +1159,54 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
+        if kvb_pair is not None:
+            return final_state, final_conv
+
+    def _forward_kvb_pair(self, mixed_qkv, b, a, lengths, source, hit):
+        """Batch the independent work for two private misses around one hit."""
+        context = get_forward_context()
+        conv, state, _ = self.kv_cache
+        left, right = lengths
+        conv_work = conv.new_empty((2, *conv.shape[1:]))
+        if source >= 0:
+            conv_work[0].copy_(conv[source])
+        conv_work[1].copy_(hit["conv"][-1])
+        weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        mixed_qkv = torch.ops._C_ascend.npu_causal_conv1d_custom(
+            mixed_qkv, weights.transpose(0, 1),
+            conv_state=conv_work, bias_opt=self.conv1d.bias,
+            query_start_loc_opt=(0, left, left + right),
+            cache_indices_opt=(0, 1),
+            initial_state_mode_opt=(int(source >= 0), 1),
+            num_accepted_tokens_opt=[],
+            activation_mode=int(bool(self.activation)), pad_slot_id=PAD_SLOT_ID, run_mode=0,
+        )
+        q, k, v = self.rearrange_mixed_qkv(mixed_qkv)
+        g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
+        q, k, v = chunk_l2norm_fwd(q.contiguous()), chunk_l2norm_fwd(k.contiguous()), v.contiguous()
+        meta = get_kvb_gdn_segment_chunk_meta(context, lengths, v.shape[-2], v.device)
+        g, _, w, u = prepare_chunk_gdn_wy(k, v, g, beta, meta.cu_seqlens, meta)
+        left_chunks = triton.cdiv(left, 64)
+        num_chunks = left_chunks + triton.cdiv(right, 64)
+        h = k.new_empty((1, num_chunks, v.shape[-2], k.shape[-1], v.shape[-1]))
+        v_new = torch.empty_like(u)
+        initial = state[source:source + 1].contiguous() if source >= 0 else None
+        _, _, boundary = chunk_gated_delta_rule_fwd_h(
+            k[:, :left], w[:, :left], u[:, :left], g[:, :left],
+            initial_state=initial, output_final_state=True, state_dtype=state.dtype,
+            out=(h[:, :left_chunks], v_new[:, :left]),
+        )
+        initial = compose_reused_gdn_states(hit["states"][-1:], hit["log_decay"][-1:], boundary[0]).to(state.dtype)
+        _, _, final_state = chunk_gated_delta_rule_fwd_h(
+            k[:, left:], w[:, left:], u[:, left:], g[:, left:],
+            initial_state=initial, output_final_state=True, state_dtype=state.dtype,
+            out=(h[:, left_chunks:], v_new[:, left:]),
+        )
+        result = chunk_fwd_o(
+            q=q, k=k, v=v_new, h=h, g=g, scale=k.shape[-1] ** -0.5,
+            cu_seqlens=meta.cu_seqlens, chunk_offsets=meta.chunk_offsets_chunk64,
+        )
+        return result.squeeze(0), final_state[0], conv_work[1]
 
     def _forward_core(
         self,
