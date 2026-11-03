@@ -493,9 +493,11 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
 
 
 def has_kvb_chunks(metadata):
-    """Only KVB dispatches carry load_chunk_meta; ordinary batches stay unchanged."""
+    """Detect KVB candidates and later prefill steps with private live state."""
     requests = getattr(metadata, "request_meta", {})
     for request in requests.values():
+        if getattr(request, "private_prefill", False):
+            return True
         chunks = getattr(request, "mamba_load_chunk_meta", ()) or getattr(request, "load_chunk_meta", ())
         if isinstance(chunks, (list, tuple)) and chunks and hasattr(chunks[0], "groups"):
             return True
@@ -513,6 +515,7 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
     context.kvb_gdn_cross_step_inputs = {}
     context.kvb_gdn_segment_chunk_meta = {}
     context.kvb_gdn_plan_log_owner = None
+    context.kvb_gdn_cache_write_limits = {}
     context.kvb_gdn_allow_reuse = enabled if allow_reuse is None else allow_reuse
     context.kvb_reuse_stats = {}
     context.kvb_reuse_block_size = None
@@ -553,6 +556,7 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
         context.kvb_gdn_cross_step_inputs = {}
         context.kvb_gdn_segment_chunk_meta = None
         context.kvb_gdn_plan_log_owner = None
+        context.kvb_gdn_cache_write_limits = {}
         context.kvb_reuse_stats = None
         context.kvb_reuse_request_ids = None
 
@@ -564,8 +568,8 @@ def compose_reused_gdn_states(clean, log_decay, initial):
     return clean.float() + decay * initial.float().unsqueeze(0)
 
 
-def iter_compute_and_reuse_segments(start, length, block_size, hits, *, allow_ahead=False):
-    """Yield absolute [start,end) compute blocks or complete reuse spans."""
+def iter_compute_and_reuse_segments(start, length, block_size, hits, *, allow_ahead=False, merge_compute_from=None):
+    """Yield compute/reuse spans, coalescing misses from the cache write limit."""
     cursor, end = start, start + length
     for hit in sorted(hits, key=lambda hit: hit["destination_start"]):
         first = hit["destination_start"]
@@ -574,13 +578,15 @@ def iter_compute_and_reuse_segments(start, length, block_size, hits, *, allow_ah
         if first < cursor or first >= end or (last > end and not ahead) or last <= first or (last - first) % block_size:
             raise ValueError("KVB spans must be disjoint, in-range complete source blocks")
         while cursor < first:
-            stop = min(first, (cursor // block_size + 1) * block_size)
+            merge = merge_compute_from is not None and cursor >= merge_compute_from
+            stop = first if merge else min(first, (cursor // block_size + 1) * block_size)
             yield cursor, stop, None
             cursor = stop
         yield first, last, hit
         cursor = last
     while cursor < end:
-        stop = min(end, (cursor // block_size + 1) * block_size)
+        merge = merge_compute_from is not None and cursor >= merge_compute_from
+        stop = end if merge else min(end, (cursor // block_size + 1) * block_size)
         yield cursor, stop, None
         cursor = stop
 
@@ -599,8 +605,10 @@ def get_kvb_gdn_segment_chunk_meta(context, length, num_heads, device):
     return cache[key]
 
 
-def build_gdn_segment_metadata(base, *, start, length, source, destination, is_prefill, device, chunk_meta=None):
-    """One physical block per kernel call: final write is its checkpoint.
+def build_gdn_segment_metadata(
+    base, *, start, length, source, destination, is_prefill, device, chunk_meta=None, save_g=True,
+):
+    """Build single-sequence metadata for a contiguous computation.
 
     Building fresh sequence metadata avoids using whole-batch scatter/chunk
     indices after token slicing. Prefill uses prebuilt single-sequence chunk
@@ -638,10 +646,27 @@ def build_gdn_segment_metadata(base, *, start, length, source, destination, is_p
             has_initial_state_cpu=torch.tensor([source >= 0], dtype=torch.bool),
         ),
     )
-    indices = torch.arange(length if is_prefill else 0, device=device, dtype=torch.long)
+    indices = torch.arange(length if is_prefill and save_g else 0, device=device, dtype=torch.long)
     meta._ascend_g_prefill_token_indices = indices
     meta._ascend_g_prefill_slot_mapping = destination * base.mamba_block_size + start % base.mamba_block_size + indices
     return meta
+
+
+def has_private_gdn_prefill(context, layer_name):
+    inputs = getattr(context, "kvb_gdn_inputs", None)
+    private = getattr(context, "kvb_gdn_cache_write_limits", {})
+    if inputs is None or not private:
+        return False
+    attn_metadata = getattr(context, "attn_metadata", None)
+    if not isinstance(attn_metadata, dict):
+        return False
+    metadata = attn_metadata.get(layer_name)
+    if not getattr(metadata, "is_all_mode", False) or getattr(metadata, "spec_state_indices_tensor", None) is not None:
+        return False
+    return any(
+        rid in private and inputs["positions"][index] < inputs["prompt_lengths"][index]
+        for index, rid in enumerate(inputs["request_ids"])
+    )
 
 
 def _log_kvb_gdn_execution(layer, request_id, composed, carried=(), *, context):
@@ -681,7 +706,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
     layer_hits = context.kvb_gdn_meta.get(layer.prefix, {})
     if getattr(context, "kvb_gdn_cross_step_inputs", {}).get(layer.prefix) or any(
         span["destination_start"] % span["block_size"] for spans in layer_hits.values() for span in spans
-    ):
+    ) or has_private_gdn_prefill(context, layer.prefix):
         return _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dense_forward)
     inputs = context.kvb_gdn_inputs
     original = context.attn_metadata
@@ -705,7 +730,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
             hits = layer_hits.get(request_id, ())
             composed = []
             segments = iter_compute_and_reuse_segments(
-                position, token_end - token_start, base.mamba_block_size, hits
+                position, token_end - token_start, base.mamba_block_size, hits,
             )
             if is_prefill and logger.isEnabledFor(logging.DEBUG):
                 segments = list(segments)
@@ -767,10 +792,13 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
         if base.has_initial_state is not None
         else [s >= 0 for s in sources]
     )
+    cache_write_limits = getattr(context, "kvb_gdn_cache_write_limits", {})
     output.zero_()
     try:
         for index, rid in enumerate(inputs["request_ids"]):
             start = inputs["positions"][index]
+            cache_write_limit = cache_write_limits.get(rid)
+            private = cache_write_limit is not None
             begin, end = inputs["query_start_loc"][index : index + 2]
             if begin == end:
                 continue
@@ -787,7 +815,8 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             carried = [(start, compute_start)] if compute_start > start else []
             # Validate the complete execution plan before modifying any cache.
             segments = list(iter_compute_and_reuse_segments(
-                compute_start, step_end - compute_start, block_size, hits, allow_ahead=True
+                compute_start, step_end - compute_start, block_size, hits, allow_ahead=True,
+                merge_compute_from=cache_write_limit if start < inputs["prompt_lengths"][index] else None,
             ))
             if start < inputs["prompt_lengths"][index]:
                 _log_kvb_gdn_plan(
@@ -808,22 +837,23 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             # Source slots may include the pool slot used for this step's input.
             # Capture that input above BEFORE installing historical checkpoints.
             protected_state_slot_ids = set()
-            for hit in hits:
+            published_hits = () if private else hits
+            for hit in published_hits:
                 if hit["destination_start"] % block_size:
                     protected_state_slot_ids.update(hit["destination_block_ids"])
-            if segments:
-                final_first, final_last, final_hit = segments[-1]
+            if segments and not private:
+                _, final_last, final_hit = segments[-1]
                 if (final_hit is not None and final_last % block_size and "next_step_state" not in final_hit) or (
-                    final_hit is None and table[final_first // block_size] in protected_state_slot_ids
+                    final_hit is None and table[(final_last - 1) // block_size] in protected_state_slot_ids
                 ):
                     raise ValueError("KVB shifted reuse must finish at a writable block checkpoint")
-            for hit in hits:
+            for hit in published_hits:
                 if hit["destination_start"] % block_size:
                     slots = hit["destination_block_ids"]
                     state[slots] = hit["source_states"].to(state.dtype)
                     conv[slots] = hit["conv"].to(conv.dtype)
             context.kvb_gdn_work_cache = (conv_work, state_work, g)
-            if cross_step_state is not None:
+            if cross_step_state is not None and not private:
                 positions = torch.arange(start, compute_start, device=g.device, dtype=torch.long)
                 physical = torch.tensor(table, device=g.device, dtype=torch.long)[positions // block_size]
                 offset = start - cross_step_state["destination_start"]
@@ -838,18 +868,19 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                     state_work[0].copy_(restored[-1])
                     conv_work[0].copy_(hit["conv"][-1])
                     has_initial = True
-                    if first % block_size == 0:
+                    if not private and first % block_size == 0:
                         slots = hit["destination_block_ids"]
                         state[slots] = restored.to(state.dtype)
                         conv[slots] = hit["conv"].to(conv.dtype)
                         saved_continuation = True
                     # g belongs to target TOKEN positions, not source-state slots.
                     actual_last = min(last, step_end)
-                    positions = torch.arange(first, actual_last, device=g.device, dtype=torch.long)
-                    physical = torch.tensor(table, device=g.device, dtype=torch.long)[positions // block_size]
-                    g[physical, positions % block_size] = (
-                        hit["g"].reshape(-1, g.shape[-1])[: actual_last - first].to(g.dtype)
-                    )
+                    if not private:
+                        positions = torch.arange(first, actual_last, device=g.device, dtype=torch.long)
+                        physical = torch.tensor(table, device=g.device, dtype=torch.long)[positions // block_size]
+                        g[physical, positions % block_size] = (
+                            hit["g"].reshape(-1, g.shape[-1])[: actual_last - first].to(g.dtype)
+                        )
                     if "next_step_state" in hit:
                         next_step_state = hit["next_step_state"]
                         next_step_state["layers"][layer.prefix]["state"].copy_(state_work[0])
@@ -858,7 +889,8 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                         saved_continuation = True
                     composed.append((first, actual_last))
                     continue
-                destination = table[first // block_size]
+                destination = table[(last - 1) // block_size]
+                publish = cache_write_limit is None or last <= cache_write_limit
                 meta = build_gdn_segment_metadata(
                     base,
                     start=first,
@@ -871,16 +903,29 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                         get_kvb_gdn_segment_chunk_meta(context, last - first, g.shape[-1], hidden_states.device)
                         if is_prefill else None
                     ),
+                    save_g=publish,
                 )
-                # Only conv/recurrent state uses slot zero in scratch. g still
-                # writes the registered pool under the original physical mapping.
-                indices = meta._ascend_g_prefill_token_indices
-                meta._ascend_g_prefill_slot_mapping = destination * block_size + first % block_size + indices
+                # Conv/recurrent state uses scratch slot zero. Private suffixes
+                # publish no intermediate checkpoints, g, or historical states.
+                if publish:
+                    meta._ascend_g_prefill_slot_mapping = (
+                        destination * block_size + first % block_size + meta._ascend_g_prefill_token_indices
+                    )
                 context.attn_metadata = {layer.prefix: meta}
                 token = begin + first - start
                 dense_forward(hidden_states[token : token + last - first], output[token : token + last - first])
                 has_initial = True
-                if destination not in protected_state_slot_ids:
+                if publish and destination not in protected_state_slot_ids:
+                    state[destination].copy_(state_work[0])
+                    conv[destination].copy_(conv_work[0])
+                    saved_continuation = True
+            if private:
+                # Keep only the live endpoint for the next step/decode. An
+                # ahead composition remains solely in its continuation buffer
+                # until scheduled tokens catch up to that endpoint.
+                working_end = segments[-1][1] if segments else carry_end
+                if working_end == step_end:
+                    destination = table[(step_end - 1) // block_size]
                     state[destination].copy_(state_work[0])
                     conv[destination].copy_(conv_work[0])
                     saved_continuation = True
@@ -969,6 +1014,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if (
             getattr(context, "kvb_gdn_meta", {}).get(self.prefix)
             or getattr(context, "kvb_gdn_cross_step_inputs", {}).get(self.prefix)
+            or has_private_gdn_prefill(context, self.prefix)
         ):
             run_segmented_gdn(
                 self,
@@ -977,7 +1023,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 context,
                 lambda hidden, out: self._forward_dense(hidden, out, segmented=True),
             )
-            # Save only after every computed/reused checkpoint is materialized.
+            # Save eligible requests after their computed checkpoints are ready.
             maybe_save_kv_layer_to_connector("", [])
             return
         self._forward_dense(hidden_states, output)
