@@ -63,7 +63,15 @@ def _copy_slots_if_needed(
     state_pool: torch.Tensor,
     src_slots: torch.Tensor,
     dst_slots: torch.Tensor,
+    *,
+    host_slots: tuple[int, int] | None = None,
 ) -> None:
+    if host_slots is not None:
+        source, destination = host_slots
+        if source >= 0 and destination >= 0 and source != destination:
+            state_pool[destination].copy_(state_pool[source])
+        return
+
     copy_idx = _nonzero_flat((src_slots >= 0) & (dst_slots >= 0) & (src_slots != dst_slots))
     if copy_idx.numel() == 0:
         return
@@ -129,6 +137,16 @@ def _build_initial_state(
     Returns:
         initial_state: [num_seqs, H, K, V] in kernel layout
     """
+    host_slots = getattr(metadata, "kvb_segment_slots", None)
+    if host_slots is not None:
+        source, _ = host_slots
+        if source < 0:
+            return ssm_state.new_zeros(1, *ssm_state.shape[1:])
+        initial = ssm_state[source : source + 1]
+        if transpose_state:
+            initial = initial.transpose(-1, -2)
+        return initial.contiguous()
+
     num_seqs = num_decodes + num_prefills
     initial = ssm_state.new_zeros(num_seqs, *ssm_state.shape[1:])
 
@@ -178,6 +196,14 @@ def _write_final_states(
         num_decodes: Number of decode sequences
         transpose_state: If True, transpose kernel [K,V]->[V,K] for pool
     """
+    host_slots = getattr(metadata, "kvb_segment_slots", None)
+    if host_slots is not None:
+        _, destination = host_slots
+        if destination >= 0:
+            state = final_state[0].transpose(-1, -2) if transpose_state else final_state[0]
+            ssm_state[destination].copy_(state)
+        return
+
     dest_slots = metadata.non_spec_state_indices_tensor  # [num_seqs]
 
     if num_decodes > 0:
@@ -313,7 +339,9 @@ def _run_all_mode_non_spec_conv1d(
         # and DEST separate, so first seed DEST from SOURCE when needed.
         src_slots = attn_metadata.block_state_indices
         dst_slots = non_spec_state_indices_tensor
-        _copy_slots_if_needed(conv_state_raw, src_slots, dst_slots)
+        _copy_slots_if_needed(
+            conv_state_raw, src_slots, dst_slots, host_slots=getattr(attn_metadata, "kvb_segment_slots", None),
+        )
 
         # Intermediate all-mode conv states do not require convolution output:
         # they are just the last (width - 1) mixed_qkv inputs at each completed
@@ -351,7 +379,9 @@ def _run_all_mode_non_spec_conv1d(
         if not getattr(attn_metadata, "skip_state_copy", False):
             src_slots = attn_metadata.block_state_indices[:num_decodes]
             dst_slots = non_spec_state_indices_tensor[:num_decodes]
-            _copy_slots_if_needed(conv_state, src_slots, dst_slots)
+            _copy_slots_if_needed(
+                conv_state, src_slots, dst_slots, host_slots=getattr(attn_metadata, "kvb_segment_slots", None),
+            )
         return causal_conv1d_update_npu(
             mixed_qkv_non_spec,
             conv_state,
@@ -424,7 +454,9 @@ def _run_all_mode_non_spec_recurrent(
         if not getattr(attn_metadata, "skip_state_copy", False):
             src_slots = attn_metadata.block_state_indices[:num_decodes]
             dst_slots = non_spec_state_indices_tensor[:num_decodes]
-            _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
+            _copy_slots_if_needed(
+                ssm_state, src_slots, dst_slots, host_slots=getattr(attn_metadata, "kvb_segment_slots", None),
+            )
         if use_torch_npu_kernel:
             cu_seqlens = non_spec_query_start_loc[: num_decodes + 1]
             actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -553,6 +585,7 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
     context.kvb_gdn_cross_step_inputs = {}
     context.kvb_gdn_host_metadata = {}
     context.kvb_gdn_segment_chunk_meta = {}
+    context.kvb_gdn_segment_metadata = {}
     context.kvb_gdn_plan_log_owner = None
     context.kvb_gdn_cache_write_limits = {}
     context.kvb_gdn_allow_reuse = enabled if allow_reuse is None else allow_reuse
@@ -601,6 +634,7 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
         context.kvb_gdn_cross_step_inputs = {}
         context.kvb_gdn_host_metadata = None
         context.kvb_gdn_segment_chunk_meta = None
+        context.kvb_gdn_segment_metadata = None
         context.kvb_gdn_plan_log_owner = None
         context.kvb_gdn_cache_write_limits = {}
         context.kvb_reuse_stats = None
@@ -653,29 +687,43 @@ def get_kvb_gdn_segment_chunk_meta(context, length, num_heads, device):
 
 def build_gdn_segment_metadata(
     base, *, start, length, source, destination, is_prefill, device, chunk_meta=None, save_g=True,
+    context=None, g_destination=None,
 ):
     """Build single-sequence metadata for a contiguous computation.
 
-    Building fresh sequence metadata avoids using whole-batch scatter/chunk
-    indices after token slicing. Prefill uses prebuilt single-sequence chunk
-    indices, not the whole-batch metadata or the FLA host-readback fallback.
+    Build dedicated indices for the sliced tokens and share them across layers
+    with the same segment and cache slots in this forward.
     """
     if is_prefill and chunk_meta is None:
         raise ValueError("KVB prefill segments require prebuilt chunk metadata")
+    device = torch.device(device)
+    g_destination = destination if g_destination is None else g_destination
+    cache = getattr(context, "kvb_gdn_segment_metadata", None)
+    key = (id(base), start, length, source, destination, is_prefill, device, id(chunk_meta), save_g, g_destination)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    # Upload the host values together. Keep the pinned buffer with the
+    # metadata, and let all layers sharing this segment reuse the device views.
+    host = torch.tensor(
+        [0, length, source, destination], dtype=torch.int32, device="cpu", pin_memory=device.type != "cpu",
+    )
+    packed = host.to(device=device, non_blocking=True)
     meta = copy(base)
     # Segments replace SOURCE/DEST slots, invalidating the whole-batch proof.
     meta.skip_state_copy = False
     meta.skip_state_copy_reason = "segmented_metadata"
+    meta.kvb_segment_slots = (source, destination)
     meta.num_decodes = int(not is_prefill)
     meta.num_prefills = int(is_prefill)
     meta.num_actual_tokens = length
     meta.num_prefill_tokens = length if is_prefill else 0
     meta.num_decode_tokens = length if not is_prefill else 0
-    meta.query_start_loc = torch.tensor([0, length], dtype=torch.int32, device=device)
+    meta.query_start_loc = packed[:2]
     meta.non_spec_query_start_loc = meta.query_start_loc
-    meta.block_state_indices = torch.tensor([source], dtype=torch.int32, device=device)
-    meta.non_spec_state_indices_tensor = torch.tensor([destination], dtype=torch.int32, device=device)
-    meta.has_initial_state = torch.tensor([source >= 0], dtype=torch.bool, device=device)
+    meta.block_state_indices = packed[2:3]
+    meta.non_spec_state_indices_tensor = packed[3:4]
+    meta.has_initial_state = meta.block_state_indices >= 0
     meta.spec_sequence_masks = None
     meta.spec_state_indices_tensor = None
     meta.spec_query_start_loc = None
@@ -687,14 +735,17 @@ def build_gdn_segment_metadata(
     meta.non_spec_prefill_fallback_meta = SimpleNamespace(
         chunk=chunk_meta,
         causal_conv1d=SimpleNamespace(
-            query_start_loc_cpu=torch.tensor([0, length], dtype=torch.int32),
-            cache_indices_cpu=torch.tensor([destination], dtype=torch.int32),
+            query_start_loc_cpu=host[:2],
+            cache_indices_cpu=host[3:4],
             has_initial_state_cpu=torch.tensor([source >= 0], dtype=torch.bool),
         ),
     )
     indices = torch.arange(length if is_prefill and save_g else 0, device=device, dtype=torch.long)
     meta._ascend_g_prefill_token_indices = indices
-    meta._ascend_g_prefill_slot_mapping = destination * base.mamba_block_size + start % base.mamba_block_size + indices
+    slot_start = g_destination * base.mamba_block_size + start % base.mamba_block_size
+    meta._ascend_g_prefill_slot_mapping = slot_start + indices
+    if cache is not None:
+        cache[key] = meta
     return meta
 
 
@@ -725,8 +776,10 @@ def _log_kvb_gdn_execution(layer, request_id, composed, carried=(), *, context):
     stats.setdefault("mamba", {}).setdefault(layer.prefix, {})[request_id] = composed_tokens + carried_tokens
 
 
-def _log_kvb_gdn_plan(layer, request_id, start, length, block_size, segments, *, context, carried=()):
-    """Report actual core-call intervals on the first GDN layer of TP rank zero."""
+def _log_kvb_gdn_plan(
+    layer, request_id, start, length, block_size, segments, *, context, carried=(), packed_blocker="aligned_path",
+):
+    """Report the dispatch path and token spans on the first GDN layer of TP rank zero."""
     if not logger.isEnabledFor(logging.DEBUG) or getattr(context, "kvb_reuse_log_rank", 0) != 0:
         return
     owner = getattr(context, "kvb_gdn_plan_log_owner", None)
@@ -739,11 +792,12 @@ def _log_kvb_gdn_plan(layer, request_id, start, length, block_size, segments, *,
     reused = list(carried) + [
         (first, min(last, step_end)) for first, last, hit in segments if hit is not None
     ]
+    packed = packed_blocker is None
     logger.debug(
         "KVB GDN PLAN request=%s layer=%s step=[%d,%d) block_size=%d "
-        "core_calls=%d compute=%s reuse=%s",
+        "core_calls=%d compute=%s reuse=%s packed_forwards=%d packed_blocker=%s",
         request_id, layer.prefix, start, step_end, block_size,
-        len(computed), computed, reused,
+        0 if packed else len(computed), computed, reused, int(packed), packed_blocker,
     )
 
 
@@ -779,7 +833,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward, pack
                 )
             for first, last, hit in segments:
                 if hit is not None:
-                    initial = state[source].clone() if source >= 0 else torch.zeros_like(state[0])
+                    initial = state[source] if source >= 0 else torch.zeros_like(state[0])
                     slots = hit["destination_block_ids"]
                     restored = compose_reused_gdn_states(hit["states"], hit["log_decay"], initial)
                     state[slots] = restored.to(state.dtype)
@@ -791,6 +845,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward, pack
                 destination = tables[index][first // base.mamba_block_size]
                 meta = build_gdn_segment_metadata(
                     base,
+                    context=context,
                     start=first,
                     length=last - first,
                     source=source,
@@ -858,39 +913,45 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 compute_start, step_end - compute_start, block_size, hits, allow_ahead=True,
                 merge_compute_from=cache_write_limit if is_prefill else None,
             ))
+            packed_blocker = None
+            if packed_forward is None or not is_prefill:
+                packed_blocker = "unsupported_forward"
+            elif cross_step_state is not None:
+                packed_blocker = "cross_step_input"
+            elif not private or cache_write_limit > start:
+                packed_blocker = "publishable_checkpoints"
+            elif (
+                len(segments) < 3
+                or segments[0][2] is not None
+                or segments[-1][2] is not None
+                or any(hit is None for _, _, hit in segments[1:-1])
+            ):
+                packed_blocker = "miss_hit_layout"
+            elif any("next_step_state" in hit for _, _, hit in segments[1:-1]):
+                packed_blocker = "cross_step_output"
             if is_prefill:
                 _log_kvb_gdn_plan(
                     layer, rid, start, end - begin, block_size, segments,
-                    context=context, carried=carried,
+                    context=context, carried=carried, packed_blocker=packed_blocker,
                 )
-            if (
-                packed_forward is not None
-                and private
-                and is_prefill
-                and cache_write_limit <= start
-                and cross_step_state is None
-                and len(segments) == 3
-                and segments[0][2] is None
-                and segments[1][2] is not None
-                and "next_step_state" not in segments[1][2]
-                and segments[2][2] is None
-            ):
-                hit_start, hit_end, hit = segments[1]
+            if packed_blocker is None:
+                hit_start, hit_end = segments[1][0], segments[-2][1]
+                packed_hits = tuple(hit for _, _, hit in segments[1:-1])
                 left_end = begin + hit_start - start
                 right_begin = begin + hit_end - start
                 lengths = (left_end - begin, end - right_begin)
                 packed = torch.cat((hidden_states[begin:left_end], hidden_states[right_begin:end]))
                 packed_output = output.new_empty((sum(lengths), *output.shape[1:]))
                 final_state, final_conv = packed_forward(
-                    packed, packed_output, kvb_pair=(lengths, source, hit),
+                    packed, packed_output, kvb_pair=(lengths, source, packed_hits),
                 )
                 output[begin:left_end].copy_(packed_output[:lengths[0]])
                 output[right_begin:end].copy_(packed_output[lengths[0]:])
                 write_checkpoint(table[(step_end - 1) // block_size], final_state, final_conv)
                 _log_kvb_gdn_execution(layer, rid, [(hit_start, hit_end)], context=context)
                 continue
-            conv_work = torch.zeros_like(conv[:1])
-            state_work = torch.zeros_like(state[:1])
+            conv_work = torch.empty_like(conv[:1])
+            state_work = torch.empty_like(state[:1])
             has_initial = False
             if cross_step_state is not None:
                 state_work[0].copy_(cross_step_state["layers"][layer.prefix]["state"])
@@ -900,6 +961,9 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 state_work[0].copy_(state[source])
                 conv_work[0].copy_(conv[source])
                 has_initial = True
+            else:
+                conv_work.zero_()
+                state_work.zero_()
             # Source slots may include the pool slot used for this step's input.
             # Capture that input above BEFORE installing historical checkpoints.
             shifted_hits = () if private else [hit for hit in hits if hit["destination_start"] % block_size]
@@ -917,7 +981,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             context.kvb_gdn_work_cache = (conv_work, state_work, g)
             if cross_step_state is not None and not private:
                 positions = torch.arange(start, compute_start, device=g.device, dtype=torch.long)
-                physical = torch.tensor(table, device=g.device, dtype=torch.long)[positions // block_size]
+                physical = base.block_table_2d[index].index_select(0, positions // block_size).long()
                 offset = start - cross_step_state["destination_start"]
                 g[physical, positions % block_size] = cross_step_state["layers"][layer.prefix]["g"][
                     offset : offset + compute_start - start
@@ -925,11 +989,15 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
             saved_continuation = False
             for first, last, hit in segments:
                 if hit is not None:
-                    restored = compose_reused_gdn_states(hit["states"], hit["log_decay"], state_work[0])
+                    publish_hit = not private and first % block_size == 0
+                    states, log_decay = hit["states"], hit["log_decay"]
+                    if not publish_hit:
+                        states, log_decay = states[-1:], log_decay[-1:]
+                    restored = compose_reused_gdn_states(states, log_decay, state_work[0])
                     state_work[0].copy_(restored[-1])
                     conv_work[0].copy_(hit["conv"][-1])
                     has_initial = True
-                    if not private and first % block_size == 0:
+                    if publish_hit:
                         slots = hit["destination_block_ids"]
                         state[slots] = restored.to(state.dtype)
                         conv[slots] = hit["conv"].to(conv.dtype)
@@ -938,7 +1006,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                     actual_last = min(last, step_end)
                     if not private:
                         positions = torch.arange(first, actual_last, device=g.device, dtype=torch.long)
-                        physical = torch.tensor(table, device=g.device, dtype=torch.long)[positions // block_size]
+                        physical = base.block_table_2d[index].index_select(0, positions // block_size).long()
                         g[physical, positions % block_size] = (
                             hit["g"].reshape(-1, g.shape[-1])[: actual_last - first].to(g.dtype)
                         )
@@ -954,6 +1022,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 publish = cache_write_limit is None or last <= cache_write_limit
                 meta = build_gdn_segment_metadata(
                     base,
+                    context=context,
                     start=first,
                     length=last - first,
                     source=0 if has_initial else -1,
@@ -965,13 +1034,8 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                         if is_prefill else None
                     ),
                     save_g=publish,
+                    g_destination=destination if publish else None,
                 )
-                # Conv/recurrent state uses scratch slot zero. Private suffixes
-                # publish no intermediate checkpoints, g, or historical states.
-                if publish:
-                    meta._ascend_g_prefill_slot_mapping = (
-                        destination * block_size + first % block_size + meta._ascend_g_prefill_token_indices
-                    )
                 context.attn_metadata = {layer.prefix: meta}
                 token = begin + first - start
                 dense_forward(hidden_states[token : token + last - first], output[token : token + last - first])
@@ -1162,15 +1226,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if kvb_pair is not None:
             return final_state, final_conv
 
-    def _forward_kvb_pair(self, mixed_qkv, b, a, lengths, source, hit):
-        """Batch the independent work for two private misses around one hit."""
+    def _forward_kvb_pair(self, mixed_qkv, b, a, lengths, source, hits):
+        """Batch two private misses around a contiguous run of hits."""
         context = get_forward_context()
         conv, state, _ = self.kv_cache
         left, right = lengths
         conv_work = conv.new_empty((2, *conv.shape[1:]))
         if source >= 0:
             conv_work[0].copy_(conv[source])
-        conv_work[1].copy_(hit["conv"][-1])
+        conv_work[1].copy_(hits[-1]["conv"][-1])
         weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
         mixed_qkv = torch.ops._C_ascend.npu_causal_conv1d_custom(
             mixed_qkv, weights.transpose(0, 1),
@@ -1196,7 +1260,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             initial_state=initial, output_final_state=True, state_dtype=state.dtype,
             out=(h[:, :left_chunks], v_new[:, :left]),
         )
-        initial = compose_reused_gdn_states(hit["states"][-1:], hit["log_decay"][-1:], boundary[0]).to(state.dtype)
+        # Worker metadata describes each hit block separately. Preserve the
+        # same composition order and state dtype as the segmented fallback.
+        initial = boundary
+        for hit in hits:
+            initial = compose_reused_gdn_states(hit["states"][-1:], hit["log_decay"][-1:], initial[0]).to(state.dtype)
         _, _, final_state = chunk_gated_delta_rule_fwd_h(
             k[:, left:], w[:, left:], u[:, left:], g[:, left:],
             initial_state=initial, output_final_state=True, state_dtype=state.dtype,

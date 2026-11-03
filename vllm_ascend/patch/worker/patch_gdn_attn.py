@@ -576,6 +576,8 @@ def build_gdn_segment_chunk_meta(
     if len(lengths) > 1:
         tensors["cu_seqlens"] = cu_seqlens
     packed_host = torch.cat([tensor.reshape(-1) for tensor in tensors.values()])
+    if device.type != "cpu":
+        packed_host = packed_host.pin_memory()
     packed_device = packed_host.to(device=device, non_blocking=True)
     views = {}
     offset = 0
