@@ -507,12 +507,48 @@ def has_kvb_chunks(metadata):
     return isinstance(children, (list, tuple)) and any(has_kvb_chunks(child) for child in children)
 
 
+def build_kvb_gdn_host_metadata(metadata, block_table_cpu, seq_lens_cpu, query_start_loc_cpu):
+    """Mirror the all-mode SOURCE slots from the runner's CPU inputs."""
+    count = metadata.num_decodes + metadata.num_prefills
+    tables = block_table_cpu[:count].tolist()
+    starts = query_start_loc_cpu[:count + 1].tolist()
+    lengths = seq_lens_cpu[:count].tolist()
+    contexts = [length - (end - begin) for length, begin, end in zip(lengths, starts, starts[1:])]
+    block_size = metadata.mamba_block_size
+    sources = [row[(length - 1) // block_size] if length > 0 else -1 for row, length in zip(tables, contexts)]
+    if metadata.has_initial_state is not None:
+        initialized = [length > 0 for length in contexts]
+    else:
+        initialized = [slot >= 0 for slot in sources]
+    return tables, sources, initialized
+
+
+def get_kvb_gdn_host_metadata(context, metadata):
+    """Read scheduling metadata once for layers sharing it in this forward."""
+    cache = getattr(context, "kvb_gdn_host_metadata", None)
+    key = id(metadata)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    host_metadata = getattr(metadata, "kvb_gdn_host_metadata", None)
+    if host_metadata is None:
+        tables = metadata.block_table_2d.detach().cpu().tolist()
+        sources = metadata.block_state_indices.detach().cpu().tolist()
+        initial = metadata.has_initial_state
+        initialized = initial.detach().cpu().tolist() if initial is not None else [slot >= 0 for slot in sources]
+        host_metadata = (tables, sources, initialized)
+    if cache is not None:
+        cache[key] = host_metadata
+    return host_metadata
+
+
 @contextmanager
 def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *, allow_reuse=None):
     """Publish CPU request ordering before the connector starts loading."""
     context.kvb_gdn_meta = {}
     context.kvb_gdn_inputs = None
     context.kvb_gdn_cross_step_inputs = {}
+    context.kvb_gdn_host_metadata = {}
     context.kvb_gdn_segment_chunk_meta = {}
     context.kvb_gdn_plan_log_owner = None
     context.kvb_gdn_cache_write_limits = {}
@@ -530,6 +566,12 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
             "prompt_lengths": input_batch.num_prompt_tokens[:count].tolist(),
         }
     try:
+        metadata = getattr(context, "attn_metadata", None)
+        if enabled and isinstance(metadata, dict):
+            # Share the host plan with the connector before it starts loading.
+            for group_metadata in metadata.values():
+                if getattr(group_metadata, "is_all_mode", False):
+                    get_kvb_gdn_host_metadata(context, group_metadata)
         yield
         block_size = context.kvb_reuse_block_size
         if enabled and block_size and context.kvb_reuse_log_rank == 0:
@@ -554,6 +596,7 @@ def kvb_forward_input_context(context, input_batch, query_start_loc, enabled, *,
         context.kvb_gdn_meta = {}
         context.kvb_gdn_inputs = None
         context.kvb_gdn_cross_step_inputs = {}
+        context.kvb_gdn_host_metadata = None
         context.kvb_gdn_segment_chunk_meta = None
         context.kvb_gdn_plan_log_owner = None
         context.kvb_gdn_cache_write_limits = {}
@@ -712,14 +755,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward):
     original = context.attn_metadata
     base = original[layer.prefix]
     conv, state, g = layer.kv_cache
-    # One batched host read per layer, never an item()/sync per token or block.
-    tables = base.block_table_2d.detach().cpu().tolist()
-    sources = base.block_state_indices.detach().cpu().tolist()
-    has_initial = (
-        base.has_initial_state.detach().cpu().tolist()
-        if base.has_initial_state is not None
-        else [source >= 0 for source in sources]
-    )
+    tables, sources, has_initial = get_kvb_gdn_host_metadata(context, base)
     output.zero_()
     try:
         for index, request_id in enumerate(inputs["request_ids"]):
@@ -785,13 +821,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
     incoming = getattr(context, "kvb_gdn_cross_step_inputs", {}).get(layer.prefix, {})
     conv, state, g = layer.kv_cache
     block_size = base.mamba_block_size
-    tables = base.block_table_2d.detach().cpu().tolist()
-    sources = base.block_state_indices.detach().cpu().tolist()
-    initialized = (
-        base.has_initial_state.detach().cpu().tolist()
-        if base.has_initial_state is not None
-        else [s >= 0 for s in sources]
-    )
+    tables, sources, initialized = get_kvb_gdn_host_metadata(context, base)
     cache_write_limits = getattr(context, "kvb_gdn_cache_write_limits", {})
     output.zero_()
     try:

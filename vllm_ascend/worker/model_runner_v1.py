@@ -110,7 +110,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
-from vllm_ascend.ops.gdn import has_kvb_chunks, kvb_forward_input_context
+from vllm_ascend.ops.gdn import build_kvb_gdn_host_metadata, has_kvb_chunks, kvb_forward_input_context
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -1704,6 +1704,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    build_kvb_host_metadata=can_batch_use_kvb,
                 )
 
             (
@@ -2434,6 +2435,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        build_kvb_host_metadata: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2609,6 +2611,20 @@ class NPUModelRunner(GPUModelRunner):
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
+                if (
+                    build_kvb_host_metadata
+                    and getattr(attn_metadata_i, "is_all_mode", False)
+                    and seq_lens_cpu is not None
+                    and attn_metadata_i.num_decodes + attn_metadata_i.num_prefills == num_reqs
+                ):
+                    # KVB admits only unpartitioned, non-spec batches, so the
+                    # group's scheduler block table is also valid on the host.
+                    attn_metadata_i.kvb_gdn_host_metadata = build_kvb_gdn_host_metadata(
+                        attn_metadata_i,
+                        self.input_batch.block_table[kv_cache_gid].get_cpu_tensor(),
+                        seq_lens_cpu,
+                        common_attn_metadata.query_start_loc_cpu,
+                    )
                 # NOTE(zxr): Due to the Triton operator does not deal with -1 padding in FullGraph mode,
                 # the padding needs to be changed from -1 to 0 to avoid writing invalid mamba block.
                 if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() \
