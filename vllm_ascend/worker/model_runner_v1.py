@@ -1705,6 +1705,15 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     build_kvb_host_metadata=can_batch_use_kvb,
+                    kvb_end_prefix_rows=tuple(
+                        getattr(
+                            scheduler_output.kv_connector_metadata.request_meta.get(rid),
+                            "end_prefix_resumed", False,
+                        )
+                        for rid in self.input_batch.req_ids
+                    ) if can_batch_use_kvb and hasattr(
+                        scheduler_output.kv_connector_metadata, "request_meta"
+                    ) else (),
                 )
 
             (
@@ -2436,6 +2445,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         build_kvb_host_metadata: bool = False,
+        kvb_end_prefix_rows: tuple[bool, ...] = (),
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2606,6 +2616,8 @@ class NPUModelRunner(GPUModelRunner):
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
+                if isinstance(builder, GDNAttentionMetadataBuilder) and any(kvb_end_prefix_rows):
+                    common_attn_metadata.kvb_end_prefix_rows = kvb_end_prefix_rows
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,

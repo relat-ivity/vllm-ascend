@@ -720,10 +720,15 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
         torch.cumsum(prefill_chunk_counts, dim=0, out=offsets[1:])
         prefill_chunk_offsets = offsets
 
-        unaligned_prefills = torch.nonzero(
-            prefill_context_lens.remainder(block_size) != 0,
-            as_tuple=False,
-        ).flatten()
+        unaligned = prefill_context_lens.remainder(block_size) != 0
+        resume_rows = getattr(m, "kvb_end_prefix_rows", ())
+        if resume_rows:
+            resume = torch.tensor(
+                resume_rows[num_decodes:num_seqs], dtype=torch.bool, device=device,
+            )
+            unaligned_prefills = torch.nonzero(unaligned & ~resume, as_tuple=False).flatten()
+        else:
+            unaligned_prefills = torch.nonzero(unaligned, as_tuple=False).flatten()
         if unaligned_prefills.numel() > 0:
             bad_idx = int(unaligned_prefills[0].item())
             raise AssertionError(
@@ -737,6 +742,9 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
             prefill_block_last - prefill_block_first,
             min=0,
         ).to(torch.long)
+        if resume_rows:
+            # The segmented GDN path writes these checkpoints at real offsets.
+            scatter_counts.masked_fill_(unaligned, 0)
         scatter_seq_ids = torch.repeat_interleave(
             torch.arange(num_prefills, device=device, dtype=torch.long),
             scatter_counts,

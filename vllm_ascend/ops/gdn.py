@@ -531,7 +531,9 @@ def has_kvb_chunks(metadata):
     """Detect KVB candidates and later prefill steps with private live state."""
     requests = getattr(metadata, "request_meta", {})
     for request in requests.values():
-        if getattr(request, "private_prefill", False):
+        if (getattr(request, "private_prefill", False)
+                or getattr(request, "end_prefix_save", None) is not None
+                or getattr(request, "end_prefix_resumed", False)):
             return True
         chunks = getattr(request, "mamba_load_chunk_meta", ()) or getattr(request, "load_chunk_meta", ())
         if isinstance(chunks, (list, tuple)) and chunks and hasattr(chunks[0], "groups"):
@@ -806,7 +808,7 @@ def run_segmented_gdn(layer, hidden_states, output, context, dense_forward, pack
     layer_hits = context.kvb_gdn_meta.get(layer.prefix, {})
     if getattr(context, "kvb_gdn_cross_step_inputs", {}).get(layer.prefix) or any(
         span["destination_start"] % span["block_size"] for spans in layer_hits.values() for span in spans
-    ) or has_private_gdn_prefill(context, layer.prefix):
+    ) or has_private_gdn_prefill(context, layer.prefix) or getattr(context, "kvb_end_prefix_targets", {}):
         return _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dense_forward, packed_forward)
     inputs = context.kvb_gdn_inputs
     original = context.attn_metadata
@@ -881,6 +883,14 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
     block_size = base.mamba_block_size
     tables, sources, initialized = get_kvb_gdn_host_metadata(context, base)
     cache_write_limits = getattr(context, "kvb_gdn_cache_write_limits", {})
+    end_prefix_targets = getattr(context, "kvb_end_prefix_targets", {})
+    resumed = getattr(context, "kvb_end_prefix_resumed", ())
+
+    def capture(rid, end, recurrent_state, conv_state):
+        if end == end_prefix_targets.get(rid):
+            context.kvb_end_prefix_states.setdefault(rid, {})[layer.prefix] = (
+                conv_state.clone(), recurrent_state.clone(),
+            )
 
     def write_checkpoint(destination, recurrent_state, conv_state):
         state[destination].copy_(recurrent_state)
@@ -913,11 +923,23 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 compute_start, step_end - compute_start, block_size, hits, allow_ahead=True,
                 merge_compute_from=cache_write_limit if is_prefill else None,
             ))
+            end_prefix = end_prefix_targets.get(rid)
+            split_at = {end_prefix} if end_prefix is not None else set()
+            if rid in resumed and start % block_size:
+                split_at.add((start // block_size + 1) * block_size)
+            if split_at:
+                split_segments = []
+                for first, last, hit in segments:
+                    bounds = [first, *sorted(p for p in split_at if hit is None and first < p < last), last]
+                    split_segments.extend((a, b, hit) for a, b in zip(bounds, bounds[1:]))
+                segments = split_segments
             packed_blocker = None
             if packed_forward is None or not is_prefill:
                 packed_blocker = "unsupported_forward"
             elif cross_step_state is not None:
                 packed_blocker = "cross_step_input"
+            elif end_prefix is not None and end_prefix != step_end:
+                packed_blocker = "end_prefix_checkpoint"
             elif not private or cache_write_limit > start:
                 packed_blocker = "publishable_checkpoints"
             elif (
@@ -948,6 +970,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 output[begin:left_end].copy_(packed_output[:lengths[0]])
                 output[right_begin:end].copy_(packed_output[lengths[0]:])
                 write_checkpoint(table[(step_end - 1) // block_size], final_state, final_conv)
+                capture(rid, step_end, final_state, final_conv)
                 _log_kvb_gdn_execution(layer, rid, [(hit_start, hit_end)], context=context)
                 continue
             conv_work = torch.empty_like(conv[:1])
@@ -957,6 +980,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 state_work[0].copy_(cross_step_state["layers"][layer.prefix]["state"])
                 conv_work[0].copy_(cross_step_state["layers"][layer.prefix]["conv"])
                 has_initial = True
+                capture(rid, carry_end, state_work[0], conv_work[0])
             elif source >= 0:
                 state_work[0].copy_(state[source])
                 conv_work[0].copy_(conv[source])
@@ -997,6 +1021,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                     state_work[0].copy_(restored[-1])
                     conv_work[0].copy_(hit["conv"][-1])
                     has_initial = True
+                    capture(rid, last, state_work[0], conv_work[0])
                     if publish_hit:
                         slots = hit["destination_block_ids"]
                         state[slots] = restored.to(state.dtype)
@@ -1040,6 +1065,7 @@ def _run_gdn_with_block_offset_reuse(layer, hidden_states, output, context, dens
                 token = begin + first - start
                 dense_forward(hidden_states[token : token + last - first], output[token : token + last - first])
                 has_initial = True
+                capture(rid, last, state_work[0], conv_work[0])
                 if publish and destination not in protected_state_slot_ids:
                     write_checkpoint(destination, state_work[0], conv_work[0])
                     saved_continuation = True
@@ -1137,6 +1163,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             getattr(context, "kvb_gdn_meta", {}).get(self.prefix)
             or getattr(context, "kvb_gdn_cross_step_inputs", {}).get(self.prefix)
             or has_private_gdn_prefill(context, self.prefix)
+            or getattr(context, "kvb_end_prefix_targets", {})
         ):
             run_segmented_gdn(
                 self,
